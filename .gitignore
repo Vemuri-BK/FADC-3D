@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+*.egg-info/
+.eggs/
+
+# Model checkpoints (use Kaggle/HuggingFace for weights)
+*.pth
+*.ckpt
+*.pt
+
+# Large medical data files
+*.nii.gz
+*.nii
+*.dcm
+*.mha
+
+# Kaggle credentials
+kaggle.json
+
+# Environment
+.env
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

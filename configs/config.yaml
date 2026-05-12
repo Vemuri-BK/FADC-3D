@@ -1,0 +1,17 @@
+model:
+  in_channels: 1        # post-contrast phase 1 only
+  out_channels: 2       # background + tumor
+  base_filters: 32      # feature maps at first encoder level
+
+data:
+  patch_size: [128, 128, 64]
+  cache_rate: 0.0       # 0.0 for CPU/local, 1.0 on Kaggle GPU
+  num_workers: 2        # 0 on Windows if multiprocessing errors occur
+
+training:
+  epochs: 300
+  batch_size: 2
+  lr: 1.0e-4
+  dice_weight: 0.5
+  ce_weight: 0.5
+  val_every: 10         # run validation every N epochs
