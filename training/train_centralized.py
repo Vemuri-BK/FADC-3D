@@ -206,8 +206,13 @@ def train(cfg, args):
 
         for batch in pbar:
             if isinstance(batch["image"], list):
-                images = torch.cat(batch["image"], dim=0).to(device)
-                labels = torch.cat(batch["label"], dim=0).to(device)
+                # PersistentDataset returns numpy arrays after disk reload — convert first
+                imgs = [torch.from_numpy(x.copy()) if isinstance(x, np.ndarray) else x
+                        for x in batch["image"]]
+                lbls = [torch.from_numpy(x.copy()) if isinstance(x, np.ndarray) else x
+                        for x in batch["label"]]
+                images = torch.cat(imgs, dim=0).to(device)
+                labels = torch.cat(lbls, dim=0).to(device)
             else:
                 images = batch["image"].to(device)
                 labels = batch["label"].to(device)
