@@ -5,6 +5,7 @@ import argparse
 import yaml
 import numpy as np
 from pathlib import Path
+from tqdm import tqdm
 
 import torch
 import torch.nn as nn
@@ -187,7 +188,10 @@ def train(cfg, args):
         num_batches = 0
         t0 = time.time()
 
-        for batch in train_loader:
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1:03d}/{epochs}",
+                    leave=False, ncols=110, unit="batch", file=sys.stdout)
+
+        for batch in pbar:
             # RandCropByPosNegLabeld returns list of patches — flatten into batch
             if isinstance(batch["image"], list):
                 images = torch.cat(batch["image"], dim=0).to(device)
@@ -212,6 +216,14 @@ def train(cfg, args):
             epoch_dice  += dice_loss.item()
             epoch_ce    += ce_loss.item()
             num_batches += 1
+
+            pbar.set_postfix({
+                "loss": f"{total_loss.item():.4f}",
+                "dice": f"{dice_loss.item():.4f}",
+                "ce":   f"{ce_loss.item():.4f}",
+            })
+
+        pbar.close()
 
         scheduler.step()
 
@@ -250,7 +262,7 @@ def train(cfg, args):
                     "best_dice":  best_dice,
                     "config":     cfg,
                 }, output_dir / "best_model.pth")
-                print(f"  → Saved best model (Dice: {best_dice:.4f})")
+                print(f"  *** NEW BEST MODEL saved — Epoch {epoch+1} | Val Dice: {best_dice:.4f} → {output_dir}/best_model.pth ***")
 
         train_log.append(log_entry)
 
