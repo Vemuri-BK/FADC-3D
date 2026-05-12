@@ -5,8 +5,9 @@ model:
 
 data:
   patch_size: [128, 128, 64]
-  cache_rate: 0.0       # 0.0 for CPU/local, 1.0 on Kaggle GPU
-  num_workers: 2        # 0 on Windows if multiprocessing errors occur
+  cache_rate: 0.0             # 0.0 for CPU/local, 1.0 on Kaggle GPU
+  num_workers: 2              # 0 on Windows if multiprocessing errors occur
+  persistent_cache_dir: ""    # if set, use PersistentDataset (preprocess once to disk)
 
 training:
   epochs: 300

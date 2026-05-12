@@ -35,6 +35,8 @@ def parse_args():
     parser.add_argument("--lr",          type=float, default=None)
     parser.add_argument("--cache_rate",  type=float, default=None)
     parser.add_argument("--num_workers", type=int, default=None)
+    parser.add_argument("--persistent_cache_dir", type=str, default=None,
+                        help="Cache preprocessed volumes to disk (recommended on Kaggle)")
     parser.add_argument("--resume",      type=str, default=None,
                         help="Path to checkpoint to resume from")
     parser.add_argument("--smoke_test",  action="store_true",
@@ -132,6 +134,7 @@ def train(cfg, args):
         num_workers=num_workers,
         batch_size=batch_size,
         max_cases=4 if args.smoke_test else None,
+        persistent_cache_dir=args.persistent_cache_dir or "",
     )
 
     # ── Model ─────────────────────────────────

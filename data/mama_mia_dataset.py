@@ -7,7 +7,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 
-from monai.data import CacheDataset, DataLoader as MonaiLoader
+from monai.data import CacheDataset, PersistentDataset, DataLoader as MonaiLoader
 from monai.transforms import (
     Compose,
     LoadImaged,
@@ -193,12 +193,14 @@ def build_centralized_loaders(
     num_workers: int = 2,
     batch_size: int = 2,
     max_cases: int = None,
+    persistent_cache_dir: str = "",
 ):
     """
     Returns (train_loader, val_loader) using all collections combined.
     cache_rate=0.0 means no caching (safe for CPU).
-    Set cache_rate=1.0 on GPU machines to cache everything in RAM.
-    max_cases: limit dataset size (used for smoke tests only).
+    persistent_cache_dir: if set, preprocesses once to disk and reuses across epochs.
+      This is the recommended mode for Kaggle — first epoch is slow (preprocessing),
+      all subsequent epochs load from disk (~10x faster than re-preprocessing).
     """
     train_cases = discover_cases(data_root, split_csv, split="train")
     val_cases   = discover_cases(data_root, split_csv, split="test")
@@ -209,18 +211,35 @@ def build_centralized_loaders(
 
     print(f"Train cases: {len(train_cases)} | Val cases: {len(val_cases)}")
 
-    train_ds = CacheDataset(
-        data=train_cases,
-        transform=get_train_transforms(),
-        cache_rate=cache_rate,
-        num_workers=num_workers,
-    )
-    val_ds = CacheDataset(
-        data=val_cases,
-        transform=get_val_transforms(),
-        cache_rate=cache_rate,
-        num_workers=num_workers,
-    )
+    if persistent_cache_dir:
+        train_cache = os.path.join(persistent_cache_dir, "train")
+        val_cache   = os.path.join(persistent_cache_dir, "val")
+        os.makedirs(train_cache, exist_ok=True)
+        os.makedirs(val_cache,   exist_ok=True)
+        print(f"Using PersistentDataset cache: {persistent_cache_dir}")
+        train_ds = PersistentDataset(
+            data=train_cases,
+            transform=get_train_transforms(),
+            cache_dir=train_cache,
+        )
+        val_ds = PersistentDataset(
+            data=val_cases,
+            transform=get_val_transforms(),
+            cache_dir=val_cache,
+        )
+    else:
+        train_ds = CacheDataset(
+            data=train_cases,
+            transform=get_train_transforms(),
+            cache_rate=cache_rate,
+            num_workers=num_workers,
+        )
+        val_ds = CacheDataset(
+            data=val_cases,
+            transform=get_val_transforms(),
+            cache_rate=cache_rate,
+            num_workers=num_workers,
+        )
 
     train_loader = MonaiLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=num_workers)
     val_loader   = MonaiLoader(val_ds,   batch_size=1,          shuffle=False, num_workers=num_workers)
