@@ -221,7 +221,7 @@ def train(cfg, args):
                 "loss": f"{total_loss.item():.4f}",
                 "dice": f"{dice_loss.item():.4f}",
                 "ce":   f"{ce_loss.item():.4f}",
-            })
+            }, refresh=False)
 
         pbar.close()
 
