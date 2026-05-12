@@ -80,8 +80,14 @@ def discover_cases(data_root: str, split_csv: str = None, split: str = "train") 
             continue
 
         # Post-contrast phase 1 as input (_0001)
+        # Support both .nii.gz (local) and .nii (Kaggle unzips to .nii)
         image_path = patient_folder / f"{patient_id}_0001.nii.gz"
-        seg_path   = seg_dir / f"{patient_id}.nii.gz"
+        if not image_path.exists():
+            image_path = patient_folder / f"{patient_id}_0001.nii"
+
+        seg_path = seg_dir / f"{patient_id}.nii.gz"
+        if not seg_path.exists():
+            seg_path = seg_dir / f"{patient_id}.nii"
 
         if not image_path.exists() or not seg_path.exists():
             continue
