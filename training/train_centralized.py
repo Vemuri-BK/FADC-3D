@@ -1,6 +1,7 @@
 import os
 import sys
 import time
+import json
 import argparse
 import yaml
 import numpy as np
@@ -36,8 +37,7 @@ def parse_args():
     parser.add_argument("--lr",          type=float, default=None)
     parser.add_argument("--cache_rate",  type=float, default=None)
     parser.add_argument("--num_workers", type=int, default=None)
-    parser.add_argument("--persistent_cache_dir", type=str, default=None,
-                        help="Cache preprocessed volumes to disk (recommended on Kaggle)")
+    parser.add_argument("--persistent_cache_dir", type=str, default=None)
     parser.add_argument("--resume",      type=str, default=None,
                         help="Path to checkpoint to resume from")
     parser.add_argument("--smoke_test",  action="store_true",
@@ -53,7 +53,6 @@ def load_config(config_path: str, args) -> dict:
     with open(config_path) as f:
         cfg = yaml.safe_load(f)
 
-    # CLI args override config file values
     if args.epochs      is not None: cfg["training"]["epochs"]      = args.epochs
     if args.batch_size  is not None: cfg["training"]["batch_size"]  = args.batch_size
     if args.lr          is not None: cfg["training"]["lr"]          = args.lr
@@ -64,20 +63,21 @@ def load_config(config_path: str, args) -> dict:
 
 
 # ─────────────────────────────────────────────
-# 3. VALIDATION — SLIDING WINDOW INFERENCE
+# 3. VALIDATION — SLIDING WINDOW + METRICS
 # ─────────────────────────────────────────────
 
 def validate(model, val_loader, dice_metric, post_pred, post_label, patch_size, device):
+    """Returns (mean_dice, mean_iou, mean_sensitivity) over all validation cases."""
     model.eval()
     dice_metric.reset()
+    iou_list  = []
+    sens_list = []
 
     with torch.no_grad():
         for batch in val_loader:
             images = batch["image"].to(device)
             labels = batch["label"].to(device)
 
-            # Sliding window inference: tiles the full volume into overlapping
-            # patches, runs model on each, stitches results back together
             preds = sliding_window_inference(
                 inputs=images,
                 roi_size=patch_size,
@@ -86,14 +86,27 @@ def validate(model, val_loader, dice_metric, post_pred, post_label, patch_size, 
                 overlap=0.5,
             )
 
-            preds_bin  = post_pred(preds)    # argmax → binary prediction
-            labels_bin = post_label(labels)  # ensure binary label
+            preds_bin  = post_pred(preds)
+            labels_bin = post_label(labels)
 
             dice_metric(y_pred=preds_bin, y=labels_bin)
 
+            # Per-case IoU (Jaccard) and Sensitivity on the foreground channel
+            pred_fg  = preds_bin[0, 1].float()
+            label_fg = labels_bin[0, 1].float()
+
+            tp = (pred_fg * label_fg).sum().item()
+            fp = (pred_fg * (1 - label_fg)).sum().item()
+            fn = ((1 - pred_fg) * label_fg).sum().item()
+
+            iou_list.append(tp / (tp + fp + fn + 1e-6))
+            sens_list.append(tp / (tp + fn + 1e-6))
+
     mean_dice = dice_metric.aggregate().item()
+    mean_iou  = float(np.mean(iou_list))  if iou_list  else 0.0
+    mean_sens = float(np.mean(sens_list)) if sens_list else 0.0
     dice_metric.reset()
-    return mean_dice
+    return mean_dice, mean_iou, mean_sens
 
 
 # ─────────────────────────────────────────────
@@ -155,7 +168,7 @@ def train(cfg, args):
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
-    scaler    = GradScaler("cuda", enabled=device.type == "cuda")  # mixed precision (GPU only)
+    scaler    = GradScaler("cuda", enabled=device.type == "cuda")
 
     # ── Metrics ───────────────────────────────
     dice_metric = DiceMetric(include_background=False, reduction="mean")
@@ -163,9 +176,9 @@ def train(cfg, args):
     post_label  = AsDiscrete(to_onehot=2)
 
     # ── Resume from checkpoint ─────────────────
-    start_epoch  = 0
-    best_dice    = 0.0
-    train_log    = []
+    start_epoch = 0
+    best_dice   = 0.0
+    train_log   = []
 
     if args.resume and os.path.exists(args.resume):
         ckpt = torch.load(args.resume, map_location=device)
@@ -178,7 +191,7 @@ def train(cfg, args):
 
     # ── Training ──────────────────────────────
     print(f"\nStarting training: {epochs} epochs | LR: {lr} | Batch: {batch_size}")
-    print("=" * 60)
+    print("=" * 70)
 
     for epoch in range(start_epoch, epochs):
         model.train()
@@ -192,7 +205,6 @@ def train(cfg, args):
                     leave=False, ncols=110, unit="batch", file=sys.stdout)
 
         for batch in pbar:
-            # RandCropByPosNegLabeld returns list of patches — flatten into batch
             if isinstance(batch["image"], list):
                 images = torch.cat(batch["image"], dim=0).to(device)
                 labels = torch.cat(batch["label"], dim=0).to(device)
@@ -224,7 +236,6 @@ def train(cfg, args):
             }, refresh=False)
 
         pbar.close()
-
         scheduler.step()
 
         avg_loss = epoch_loss / num_batches
@@ -233,52 +244,64 @@ def train(cfg, args):
         elapsed  = time.time() - t0
         lr_now   = scheduler.get_last_lr()[0]
 
+        mins, secs = divmod(int(elapsed), 60)
         print(f"Epoch {epoch+1:03d}/{epochs} | "
               f"Loss: {avg_loss:.4f} | Dice loss: {avg_dice:.4f} | CE loss: {avg_ce:.4f} | "
-              f"LR: {lr_now:.2e} | Time: {elapsed:.0f}s")
+              f"LR: {lr_now:.2e} | Time: {mins}m {secs}s")
 
         log_entry = {
-            "epoch": epoch + 1,
-            "loss": avg_loss,
+            "epoch":     epoch + 1,
+            "loss":      avg_loss,
             "dice_loss": avg_dice,
-            "ce_loss": avg_ce,
-            "lr": lr_now,
+            "ce_loss":   avg_ce,
+            "lr":        lr_now,
+            "time_s":    elapsed,
         }
 
         # ── Validation ────────────────────────
         if (epoch + 1) % val_every == 0:
-            val_dice = validate(model, val_loader, dice_metric,
-                                post_pred, post_label, patch_size, device)
-            print(f"  → Val Dice: {val_dice:.4f}  (best: {best_dice:.4f})")
-            log_entry["val_dice"] = val_dice
+            val_dice, val_iou, val_sens = validate(
+                model, val_loader, dice_metric,
+                post_pred, post_label, patch_size, device
+            )
+            marker = " <-- BEST" if val_dice > best_dice else ""
+            print(f"  Val  Dice: {val_dice:.4f} | IoU: {val_iou:.4f} | Sensitivity: {val_sens:.4f}"
+                  f"  (best so far: {best_dice:.4f}){marker}")
+
+            log_entry["val_dice"]        = val_dice
+            log_entry["val_iou"]         = val_iou
+            log_entry["val_sensitivity"] = val_sens
 
             if val_dice > best_dice:
                 best_dice = val_dice
                 torch.save({
-                    "epoch":      epoch,
-                    "model":      model.state_dict(),
-                    "optimizer":  optimizer.state_dict(),
-                    "scheduler":  scheduler.state_dict(),
-                    "best_dice":  best_dice,
-                    "config":     cfg,
+                    "epoch":     epoch,
+                    "model":     model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(),
+                    "best_dice": best_dice,
+                    "config":    cfg,
                 }, output_dir / "best_model.pth")
-                print(f"  *** NEW BEST MODEL saved — Epoch {epoch+1} | Val Dice: {best_dice:.4f} → {output_dir}/best_model.pth ***")
+                print(f"  {'*' * 60}")
+                print(f"  *** NEW BEST  Epoch {epoch+1:03d} | "
+                      f"Dice {best_dice:.4f} | IoU {val_iou:.4f} | Sensitivity {val_sens:.4f} ***")
+                print(f"  *** Saved -> {output_dir}/best_model.pth")
+                print(f"  {'*' * 60}")
 
         train_log.append(log_entry)
 
-        # Save latest checkpoint every 10 epochs for resuming
-        if (epoch + 1) % 10 == 0:
+        # Save latest checkpoint every 5 epochs for resuming
+        if (epoch + 1) % 5 == 0:
             torch.save({
-                "epoch":      epoch,
-                "model":      model.state_dict(),
-                "optimizer":  optimizer.state_dict(),
-                "scheduler":  scheduler.state_dict(),
-                "best_dice":  best_dice,
-                "config":     cfg,
+                "epoch":     epoch,
+                "model":     model.state_dict(),
+                "optimizer": optimizer.state_dict(),
+                "scheduler": scheduler.state_dict(),
+                "best_dice": best_dice,
+                "config":    cfg,
             }, output_dir / "latest_checkpoint.pth")
 
     # ── Save training log ─────────────────────
-    import json
     with open(output_dir / "train_log.json", "w") as f:
         json.dump(train_log, f, indent=2)
 
