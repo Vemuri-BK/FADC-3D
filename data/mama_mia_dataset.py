@@ -8,6 +8,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from monai.data import CacheDataset, PersistentDataset, DataLoader as MonaiLoader
+from monai.data.utils import list_data_collate
 from monai.transforms import (
     Compose,
     LoadImaged,
@@ -28,6 +29,24 @@ from monai.transforms import (
 
 
 DATA_ROOT = r"C:\Users\bhara\Desktop\MAMA_MIA_COMPLETE"
+
+
+def _safe_collate(batch):
+    """numpy→tensor conversion before list_data_collate.
+
+    PersistentDataset loads cached items as numpy arrays. PyTorch's default_collate
+    (called inside list_data_collate) can't handle numpy, so we convert first.
+    """
+    def convert(item):
+        if isinstance(item, dict):
+            return {k: convert(v) for k, v in item.items()}
+        if isinstance(item, list):
+            return [convert(i) for i in item]
+        if isinstance(item, np.ndarray):
+            return torch.as_tensor(item.copy())
+        return item
+
+    return list_data_collate([convert(b) for b in batch])
 
 COLLECTIONS = ["DUKE", "ISPY1", "ISPY2", "NACT"]
 
@@ -247,8 +266,10 @@ def build_centralized_loaders(
             num_workers=num_workers,
         )
 
-    train_loader = MonaiLoader(train_ds, batch_size=batch_size, shuffle=True,  num_workers=num_workers)
-    val_loader   = MonaiLoader(val_ds,   batch_size=1,          shuffle=False, num_workers=num_workers)
+    train_loader = MonaiLoader(train_ds, batch_size=batch_size, shuffle=True,
+                               num_workers=num_workers, collate_fn=_safe_collate)
+    val_loader   = MonaiLoader(val_ds,   batch_size=1,          shuffle=False,
+                               num_workers=num_workers, collate_fn=_safe_collate)
 
     return train_loader, val_loader
 
