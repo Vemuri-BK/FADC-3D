@@ -5,7 +5,7 @@ import numpy as np
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 
 from monai.data import CacheDataset, PersistentDataset, DataLoader as MonaiLoader
 from monai.data.utils import list_data_collate
@@ -207,6 +207,66 @@ def get_val_transforms():
     ])
 
 
+def get_rand_train_transforms():
+    """Random-only transforms applied at training time to preprocessed volumes."""
+    return Compose([
+        RandCropByPosNegLabeld(
+            keys=["image", "label"],
+            label_key="label",
+            spatial_size=PATCH_SIZE,
+            pos=POS_NEG_RATIO,
+            neg=POS_NEG_RATIO,
+            num_samples=2,
+            image_key="image",
+            image_threshold=0,
+        ),
+        RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
+        RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
+        RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=2),
+        RandRotate90d(keys=["image", "label"], prob=0.5, max_k=3),
+        RandScaleIntensityd(keys=["image"], factors=0.1, prob=0.5),
+        RandShiftIntensityd(keys=["image"], offsets=0.1, prob=0.5),
+        EnsureTyped(keys=["image", "label"]),
+    ])
+
+
+# ─────────────────────────────────────────────
+# 3b. PREPROCESSED CACHE DATASET
+# ─────────────────────────────────────────────
+
+class PreprocessedDataset(Dataset):
+    """
+    Loads preprocessed .npz files (float16 image, uint8 label) produced by
+    scripts/preprocess_to_cache.py and applies random augmentations on the fly.
+
+    Each __getitem__ returns a list of 2 patch dicts (from RandCrop num_samples=2)
+    — same structure CacheDataset returns, so _safe_collate works unchanged.
+    """
+
+    def __init__(self, cache_dir: str, cases: list[dict], is_train: bool = True):
+        self.cache_dir = Path(cache_dir)
+        self.cases     = cases
+        self.transform = get_rand_train_transforms() if is_train else None
+
+    def __len__(self):
+        return len(self.cases)
+
+    def __getitem__(self, idx):
+        patient_id = self.cases[idx]["patient_id"]
+        npz_path   = self.cache_dir / f"{patient_id}.npz"
+
+        data_npz = np.load(npz_path)
+        item = {
+            "image": torch.from_numpy(data_npz["image"].astype(np.float32)),
+            "label": torch.from_numpy(data_npz["label"].astype(np.float32)),
+        }
+
+        if self.transform is not None:
+            item = self.transform(item)
+
+        return item
+
+
 # ─────────────────────────────────────────────
 # 3. DATASET BUILDERS
 # ─────────────────────────────────────────────
@@ -219,13 +279,16 @@ def build_centralized_loaders(
     batch_size: int = 2,
     max_cases: int = None,
     persistent_cache_dir: str = "",
+    preprocessed_cache_dir: str = "",
 ):
     """
     Returns (train_loader, val_loader) using all collections combined.
-    cache_rate=0.0 means no caching (safe for CPU).
-    persistent_cache_dir: if set, preprocesses once to disk and reuses across epochs.
-      This is the recommended mode for Kaggle — first epoch is slow (preprocessing),
-      all subsequent epochs load from disk (~10x faster than re-preprocessing).
+
+    preprocessed_cache_dir: path to .npz cache built by scripts/preprocess_to_cache.py.
+      Fastest option — skips all NIfTI loading and resampling on Kaggle.
+      Expected layout: <cache_dir>/train/{patient_id}.npz, <cache_dir>/val/{patient_id}.npz
+    persistent_cache_dir: MONAI PersistentDataset cache (preprocess once to disk per session).
+    cache_rate=0.0: no caching — slowest but works anywhere.
     """
     train_cases = discover_cases(data_root, split_csv, split="train")
     val_cases   = discover_cases(data_root, split_csv, split="test")
@@ -236,7 +299,13 @@ def build_centralized_loaders(
 
     print(f"Train cases: {len(train_cases)} | Val cases: {len(val_cases)}")
 
-    if persistent_cache_dir:
+    if preprocessed_cache_dir:
+        train_cache = os.path.join(preprocessed_cache_dir, "train")
+        val_cache   = os.path.join(preprocessed_cache_dir, "val")
+        print(f"Using preprocessed .npz cache: {preprocessed_cache_dir}")
+        train_ds = PreprocessedDataset(train_cache, train_cases, is_train=True)
+        val_ds   = PreprocessedDataset(val_cache,   val_cases,   is_train=False)
+    elif persistent_cache_dir:
         train_cache = os.path.join(persistent_cache_dir, "train")
         val_cache   = os.path.join(persistent_cache_dir, "val")
         os.makedirs(train_cache, exist_ok=True)
@@ -267,9 +336,11 @@ def build_centralized_loaders(
         )
 
     train_loader = MonaiLoader(train_ds, batch_size=batch_size, shuffle=True,
-                               num_workers=num_workers, collate_fn=_safe_collate)
+                               num_workers=num_workers, collate_fn=_safe_collate,
+                               pin_memory=True, persistent_workers=num_workers > 0)
     val_loader   = MonaiLoader(val_ds,   batch_size=1,          shuffle=False,
-                               num_workers=num_workers, collate_fn=_safe_collate)
+                               num_workers=num_workers, collate_fn=_safe_collate,
+                               pin_memory=True, persistent_workers=num_workers > 0)
 
     return train_loader, val_loader
 
