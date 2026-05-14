@@ -89,7 +89,7 @@ def validate(model, val_loader, dice_metric, post_pred, post_label, patch_size, 
             )
 
             preds_bin  = post_pred(preds)
-            labels_bin = post_label(labels)
+            labels_bin = post_label(labels.long())
 
             dice_metric(y_pred=preds_bin, y=labels_bin)
 
