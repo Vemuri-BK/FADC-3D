@@ -15,6 +15,7 @@ from torch.amp import GradScaler, autocast
 from monai.metrics import DiceMetric
 from monai.transforms import AsDiscrete
 from monai.inferers import sliding_window_inference
+from monai.data import decollate_batch
 
 sys.path.append(str(Path(__file__).parent.parent))
 from data.mama_mia_dataset import build_centralized_loaders, DATA_ROOT
@@ -88,14 +89,14 @@ def validate(model, val_loader, dice_metric, post_pred, post_label, patch_size, 
                 overlap=0.5,
             )
 
-            preds_bin  = post_pred(preds)
-            labels_bin = post_label(labels.long())
+            preds_bin  = [post_pred(i)          for i in decollate_batch(preds)]
+            labels_bin = [post_label(i.long())  for i in decollate_batch(labels)]
 
             dice_metric(y_pred=preds_bin, y=labels_bin)
 
             # Per-case IoU (Jaccard) and Sensitivity on the foreground channel
-            pred_fg  = preds_bin[0, 1].float()
-            label_fg = labels_bin[0, 1].float()
+            pred_fg  = preds_bin[0][1].float()
+            label_fg = labels_bin[0][1].float()
 
             tp = (pred_fg * label_fg).sum().item()
             fp = (pred_fg * (1 - label_fg)).sum().item()
