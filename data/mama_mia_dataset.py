@@ -246,6 +246,7 @@ class PreprocessedDataset(Dataset):
     def __init__(self, cache_dir: str, cases: list[dict], is_train: bool = True):
         self.cache_dir = Path(cache_dir)
         self.cases     = cases
+        self.is_train  = is_train
         self.transform = get_rand_train_transforms() if is_train else None
 
     def __len__(self):
@@ -255,16 +256,21 @@ class PreprocessedDataset(Dataset):
         patient_id = self.cases[idx]["patient_id"]
         npz_path   = self.cache_dir / f"{patient_id}.npz"
 
-        data_npz = np.load(npz_path)
-        item = {
-            "image": torch.from_numpy(data_npz["image"].astype(np.float32)),
-            "label": torch.from_numpy(data_npz["label"].astype(np.float32)),
-        }
-
-        if self.transform is not None:
-            item = self.transform(item)
-
-        return item
+        try:
+            data_npz = np.load(npz_path)
+            item = {
+                "image": torch.from_numpy(data_npz["image"].astype(np.float32)),
+                "label": torch.from_numpy(data_npz["label"].astype(np.float32)),
+            }
+            if self.transform is not None:
+                item = self.transform(item)
+            return item
+        except Exception:
+            # Corrupted .npz — fall back to raw NIfTI loading for this case
+            import warnings
+            warnings.warn(f"Corrupted cache for {patient_id}, falling back to NIfTI load")
+            fallback = get_train_transforms() if self.is_train else get_val_transforms()
+            return fallback(self.cases[idx])
 
 
 # ─────────────────────────────────────────────
