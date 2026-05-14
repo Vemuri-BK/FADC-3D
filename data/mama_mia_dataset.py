@@ -270,7 +270,11 @@ class PreprocessedDataset(Dataset):
             import warnings
             warnings.warn(f"Corrupted cache for {patient_id}, falling back to NIfTI load")
             fallback = get_train_transforms() if self.is_train else get_val_transforms()
-            return fallback(self.cases[idx])
+            result = fallback(self.cases[idx])
+            # Strip extra keys so structure matches the .npz path (image+label only)
+            if isinstance(result, list):
+                return [{"image": p["image"], "label": p["label"]} for p in result]
+            return {"image": result["image"], "label": result["label"]}
 
 
 # ─────────────────────────────────────────────
