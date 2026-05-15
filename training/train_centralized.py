@@ -81,13 +81,14 @@ def validate(model, val_loader, dice_metric, post_pred, post_label, patch_size, 
             images = batch["image"].to(device)
             labels = batch["label"].to(device)
 
-            preds = sliding_window_inference(
-                inputs=images,
-                roi_size=patch_size,
-                sw_batch_size=1,
-                predictor=model,
-                overlap=0.5,
-            )
+            with autocast("cuda", enabled=device.type == "cuda"):
+                preds = sliding_window_inference(
+                    inputs=images,
+                    roi_size=patch_size,
+                    sw_batch_size=4,
+                    predictor=model,
+                    overlap=0.25,
+                )
 
             preds_bin  = [post_pred(i)          for i in decollate_batch(preds)]
             labels_bin = [post_label(i.long())  for i in decollate_batch(labels)]
