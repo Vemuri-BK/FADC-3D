@@ -49,6 +49,9 @@ def parse_args():
     parser.add_argument("--model",       type=str, default="unet3d",
                         choices=["unet3d", "unet3d_fadc"],
                         help="Model architecture to train")
+    parser.add_argument("--patch_size",  type=int, nargs=3, default=None,
+                        metavar=("X", "Y", "Z"),
+                        help="Override patch size, e.g. --patch_size 96 96 48")
     return parser.parse_args()
 
 
@@ -65,6 +68,7 @@ def load_config(config_path: str, args) -> dict:
     if args.lr          is not None: cfg["training"]["lr"]          = args.lr
     if args.cache_rate  is not None: cfg["data"]["cache_rate"]      = args.cache_rate
     if args.num_workers is not None: cfg["data"]["num_workers"]     = args.num_workers
+    if args.patch_size  is not None: cfg["data"]["patch_size"]      = args.patch_size
 
     return cfg
 
