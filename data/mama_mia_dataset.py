@@ -170,7 +170,7 @@ def get_train_transforms(patch_size=None):
             spatial_size=ps,
             pos=POS_NEG_RATIO,
             neg=POS_NEG_RATIO,
-            num_samples=2,      # 2 patches per volume per iteration
+            num_samples=1,
             image_key="image",
             image_threshold=0,
         ),
@@ -218,7 +218,7 @@ def get_rand_train_transforms(patch_size=None):
             spatial_size=ps,
             pos=POS_NEG_RATIO,
             neg=POS_NEG_RATIO,
-            num_samples=2,
+            num_samples=1,
             image_key="image",
             image_threshold=0,
         ),
