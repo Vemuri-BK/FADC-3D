@@ -126,11 +126,12 @@ def discover_cases(data_root: str, split_csv: str = None, split: str = "train") 
 # 2. TRANSFORMS
 # ─────────────────────────────────────────────
 
-PATCH_SIZE = (128, 128, 64)   # spatial patch fed to the model
-POS_NEG_RATIO = 1             # 1:1 — half patches centered on tumor, half random
+DEFAULT_PATCH_SIZE = (128, 128, 64)   # used when no override is provided
+POS_NEG_RATIO = 1                     # 1:1 — half patches centered on tumor, half random
 
 
-def get_train_transforms():
+def get_train_transforms(patch_size=None):
+    ps = tuple(patch_size) if patch_size is not None else DEFAULT_PATCH_SIZE
     return Compose([
         # Load NIfTI files from disk
         LoadImaged(keys=["image", "label"]),
@@ -159,14 +160,14 @@ def get_train_transforms():
         # Remove black background — crop tight around non-zero voxels
         CropForegroundd(keys=["image", "label"], source_key="image"),
 
-        # Ensure volume is at least patch size — some small volumes shrink below 128³ after resampling
-        SpatialPadd(keys=["image", "label"], spatial_size=PATCH_SIZE),
+        # Ensure volume is at least patch size
+        SpatialPadd(keys=["image", "label"], spatial_size=ps),
 
         # Random patch: 50% centered on tumor, 50% random background
         RandCropByPosNegLabeld(
             keys=["image", "label"],
             label_key="label",
-            spatial_size=PATCH_SIZE,
+            spatial_size=ps,
             pos=POS_NEG_RATIO,
             neg=POS_NEG_RATIO,
             num_samples=2,      # 2 patches per volume per iteration
@@ -207,13 +208,14 @@ def get_val_transforms():
     ])
 
 
-def get_rand_train_transforms():
+def get_rand_train_transforms(patch_size=None):
     """Random-only transforms applied at training time to preprocessed volumes."""
+    ps = tuple(patch_size) if patch_size is not None else DEFAULT_PATCH_SIZE
     return Compose([
         RandCropByPosNegLabeld(
             keys=["image", "label"],
             label_key="label",
-            spatial_size=PATCH_SIZE,
+            spatial_size=ps,
             pos=POS_NEG_RATIO,
             neg=POS_NEG_RATIO,
             num_samples=2,
@@ -243,11 +245,12 @@ class PreprocessedDataset(Dataset):
     — same structure CacheDataset returns, so _safe_collate works unchanged.
     """
 
-    def __init__(self, cache_dir: str, cases: list[dict], is_train: bool = True):
-        self.cache_dir = Path(cache_dir)
-        self.cases     = cases
-        self.is_train  = is_train
-        self.transform = get_rand_train_transforms() if is_train else None
+    def __init__(self, cache_dir: str, cases: list[dict], is_train: bool = True, patch_size=None):
+        self.cache_dir  = Path(cache_dir)
+        self.cases      = cases
+        self.is_train   = is_train
+        self.patch_size = patch_size
+        self.transform  = get_rand_train_transforms(patch_size) if is_train else None
 
     def __len__(self):
         return len(self.cases)
@@ -269,7 +272,7 @@ class PreprocessedDataset(Dataset):
             # Corrupted .npz — fall back to raw NIfTI loading for this case
             import warnings
             warnings.warn(f"Corrupted cache for {patient_id}, falling back to NIfTI load")
-            fallback = get_train_transforms() if self.is_train else get_val_transforms()
+            fallback = get_train_transforms(self.patch_size) if self.is_train else get_val_transforms()
             result = fallback(self.cases[idx])
             # Strip extra keys so structure matches the .npz path (image+label only)
             if isinstance(result, list):
@@ -290,6 +293,7 @@ def build_centralized_loaders(
     max_cases: int = None,
     persistent_cache_dir: str = "",
     preprocessed_cache_dir: str = "",
+    patch_size=None,
 ):
     """
     Returns (train_loader, val_loader) using all collections combined.
@@ -313,8 +317,8 @@ def build_centralized_loaders(
         train_cache = os.path.join(preprocessed_cache_dir, "train")
         val_cache   = os.path.join(preprocessed_cache_dir, "val")
         print(f"Using preprocessed .npz cache: {preprocessed_cache_dir}")
-        train_ds = PreprocessedDataset(train_cache, train_cases, is_train=True)
-        val_ds   = PreprocessedDataset(val_cache,   val_cases,   is_train=False)
+        train_ds = PreprocessedDataset(train_cache, train_cases, is_train=True,  patch_size=patch_size)
+        val_ds   = PreprocessedDataset(val_cache,   val_cases,   is_train=False, patch_size=patch_size)
     elif persistent_cache_dir:
         train_cache = os.path.join(persistent_cache_dir, "train")
         val_cache   = os.path.join(persistent_cache_dir, "val")
@@ -323,7 +327,7 @@ def build_centralized_loaders(
         print(f"Using PersistentDataset cache: {persistent_cache_dir}")
         train_ds = PersistentDataset(
             data=train_cases,
-            transform=get_train_transforms(),
+            transform=get_train_transforms(patch_size),
             cache_dir=train_cache,
         )
         val_ds = PersistentDataset(
@@ -334,7 +338,7 @@ def build_centralized_loaders(
     else:
         train_ds = CacheDataset(
             data=train_cases,
-            transform=get_train_transforms(),
+            transform=get_train_transforms(patch_size),
             cache_rate=cache_rate,
             num_workers=num_workers,
         )

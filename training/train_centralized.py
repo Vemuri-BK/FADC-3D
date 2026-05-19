@@ -162,6 +162,7 @@ def train(cfg, args):
         max_cases=4 if args.smoke_test else None,
         persistent_cache_dir=args.persistent_cache_dir or "",
         preprocessed_cache_dir=args.preprocessed_cache_dir or "",
+        patch_size=patch_size,
     )
 
     # ── Model ─────────────────────────────────
