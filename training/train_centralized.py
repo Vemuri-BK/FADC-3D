@@ -20,6 +20,7 @@ from monai.data import decollate_batch
 sys.path.append(str(Path(__file__).parent.parent))
 from data.mama_mia_dataset import build_centralized_loaders, DATA_ROOT
 from models.unet_3d import UNet3D
+from models.unet_3d_fadc import UNet3DFADC
 from training.losses import DiceCELoss
 
 
@@ -45,6 +46,9 @@ def parse_args():
                         help="Path to checkpoint to resume from")
     parser.add_argument("--smoke_test",  action="store_true",
                         help="Run 2 epochs on 4 cases to verify pipeline end-to-end")
+    parser.add_argument("--model",       type=str, default="unet3d",
+                        choices=["unet3d", "unet3d_fadc"],
+                        help="Model architecture to train")
     return parser.parse_args()
 
 
@@ -157,14 +161,18 @@ def train(cfg, args):
     )
 
     # ── Model ─────────────────────────────────
-    model = UNet3D(
+    model_kwargs = dict(
         in_channels=cfg["model"]["in_channels"],
         out_channels=cfg["model"]["out_channels"],
         base_filters=cfg["model"]["base_filters"],
-    ).to(device)
+    )
+    if args.model == "unet3d_fadc":
+        model = UNet3DFADC(**model_kwargs).to(device)
+    else:
+        model = UNet3D(**model_kwargs).to(device)
 
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Model: UNet3D | Parameters: {total_params:,}")
+    print(f"Model: {args.model} | Parameters: {total_params:,}")
 
     # ── Loss, Optimizer, Scheduler ────────────
     criterion = DiceCELoss(

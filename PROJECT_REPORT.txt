@@ -1,0 +1,691 @@
+================================================================================
+  FADC 3D BREAST MRI TUMOR SEGMENTATION — COMPLETE PROJECT REPORT
+  Author       : Bharath Kumar Vemuri
+  Date Updated : 2026-05-19
+  Status       : Phase 1 — FADC training pending (smoke test in progress)
+================================================================================
+
+
+--------------------------------------------------------------------------------
+1. PROJECT OVERVIEW
+--------------------------------------------------------------------------------
+
+Goal:
+  Extend Frequency-Adaptive Dilated Convolution (FADC, CVPR 2024) from 2D
+  natural image segmentation to 3D volumetric medical image segmentation,
+  applied to breast tumor delineation in Dynamic Contrast-Enhanced MRI (DCE-MRI).
+
+Why this matters:
+  - Breast cancer diagnosis via DCE-MRI requires accurate tumor boundary
+    delineation. Manual segmentation is time-consuming and expert-dependent.
+  - Tumors vary enormously in size (2mm nodules to 80mm+ masses), making
+    fixed-scale convolution inadequate.
+  - Multi-center data (different scanners, protocols, populations) introduces
+    domain shift — motivating federated learning in Phase 2.
+
+Novel Contributions:
+  1. First 3D extension of FADC for volumetric medical imaging.
+  2. A new 3D reformulation of the FADC core mechanism (detailed in Section 5)
+     that replaces the 2D-only deformable convolution with a parallel
+     dilated convolution design weighted by OmniAttention3D.
+  3. Application to the large-scale multi-center MAMA-MIA dataset (1506 cases).
+  4. [Phase 2] Federated multi-center training across 4 breast MRI collections.
+
+Target Publication:
+  "Frequency-Adaptive Dilated Convolution for Federated Breast MRI Tumor
+   Segmentation: A Multi-Center Study"
+  Target Venues: Medical Image Analysis / IEEE TMI / MICCAI 2026
+
+
+--------------------------------------------------------------------------------
+2. DATASET — MAMA-MIA
+--------------------------------------------------------------------------------
+
+Total Cases   : 1506 patients across 4 collections
+Collections   :
+  DUKE  :  291 cases — academic hospital, large tumors common
+  ISPY1 :  171 cases — neoadjuvant chemotherapy trial
+  ISPY2 :  980 cases — largest collection, highly heterogeneous tumor sizes
+  NACT  :   64 cases — neoadjuvant chemotherapy, predominantly large tumors
+
+Input:
+  File suffix _0001.nii (post-contrast DCE-MRI phase 1 only).
+  Rationale: Phase 1 post-contrast shows peak gadolinium enhancement in
+  tumor tissue — highest tumor-to-background contrast. Using a single phase
+  (in_channels=1) avoids registration artifacts between multi-phase volumes
+  and keeps the model simpler.
+
+Segmentation labels:
+  expert/{patient_id}.nii — binary mask (0=background, 1=tumor).
+  All segmentations are expert delineations from the MAMA-MIA dataset release.
+
+Train/Val split:
+  Source: train_test_splits.csv (provided with dataset)
+  Train : 1200 cases
+  Val   :  306 cases
+
+Paper reference baseline Dice: 0.762 (from MAMA-MIA dataset paper)
+Our 3D U-Net baseline Dice   : 0.6035 (locked, 50 epochs)
+
+Preprocessing Cache (.npz):
+  Raw NIfTI loading + augmentation per epoch: ~27 min/epoch
+  Pre-extracted .npz cache (21.72 GB, 1492 cases): ~7 min/epoch
+  Exception: duke_048 is always corrupted in cache — falls back to NIfTI (harmless)
+
+Paths:
+  Local  : C:\Users\bhara\Desktop\MAMA_MIA_COMPLETE
+  Kaggle : /kaggle/input/.../mama_mia_kaggle_upload
+  Cache  : Kaggle dataset "mama-mia-preprocessed-cache"
+
+
+--------------------------------------------------------------------------------
+3. TRAINING CONFIGURATION (IDENTICAL FOR ALL MODEL VARIANTS)
+--------------------------------------------------------------------------------
+
+Using the same config for all models ensures the comparison is fair —
+only the architecture changes between baseline and FADC variants.
+
+Patch size         : 128 x 128 x 64 voxels
+Batch size         : 2 (RandCrop num_samples=2 → 4 patches per forward pass)
+Epochs             : 50
+Learning rate      : 1e-4
+LR Scheduler       : CosineAnnealingLR, T_max=50, eta_min=1e-6
+Loss function      : 0.5 × Dice Loss + 0.5 × Cross-Entropy Loss
+Optimizer          : AdamW, weight_decay=1e-5
+Gradient clipping  : max_norm=1.0
+Mixed precision    : AMP enabled (FP16 forward/backward, FP32 weights)
+Validation every   : 10 epochs
+Sliding window     : overlap=0.25, sw_batch_size=4, autocast=True
+Checkpoint saved   : every 5 epochs (latest_checkpoint.pth) +
+                     best Val Dice (best_model.pth)
+GPU (Kaggle)       : T4 x2
+
+
+--------------------------------------------------------------------------------
+4. PHASE 1 — STEP 1: 3D U-NET BASELINE (COMPLETE)
+--------------------------------------------------------------------------------
+
+File       : models/unet_3d.py
+Parameters : 22,500,000 (22.5M)
+Status     : COMPLETE — Val Dice 0.6035 at epoch 50 (LOCKED BASELINE)
+
+4A. ARCHITECTURE
+-----------------
+The baseline is a standard 3D U-Net with encoder-decoder structure and
+skip connections. It serves as the control model — no frequency adaptation,
+no attention, fixed dilation=1 throughout.
+
+Basic building block — ConvBlock:
+  Conv3d(in_ch, out_ch, kernel=3, pad=1, bias=False)
+    → BatchNorm3d(out_ch)
+    → ReLU(inplace=True)
+    → Conv3d(out_ch, out_ch, kernel=3, pad=1, bias=False)
+    → BatchNorm3d(out_ch)
+    → ReLU(inplace=True)
+
+  Two conv layers per block. bias=False because BatchNorm absorbs any
+  additive constant, making a bias parameter redundant.
+
+Encoder (4 DownBlocks):
+  DownBlock = ConvBlock + MaxPool3d(kernel=2, stride=2)
+  enc1: (1  → 32 channels)   spatial: 128×128×64 → pool → 64×64×32
+  enc2: (32 → 64 channels)   spatial: 64×64×32   → pool → 32×32×16
+  enc3: (64 → 128 channels)  spatial: 32×32×16   → pool → 16×16×8
+  enc4: (128→ 256 channels)  spatial: 16×16×8    → pool → 8×8×4
+
+  Each DownBlock saves the pre-pool output as a skip connection (s1–s4).
+
+Bottleneck (ConvBlock):
+  256 → 512 channels at spatial size 8×8×4
+
+Decoder (4 UpBlocks):
+  UpBlock = ConvTranspose3d(in_ch, out_ch, kernel=2, stride=2)
+          + concatenate skip connection
+          + ConvBlock(in_ch, out_ch)   [in_ch = out_ch + skip_ch]
+  dec4: 512 → 256, concat s4 → ConvBlock(512→256)
+  dec3: 256 → 128, concat s3 → ConvBlock(256→128)
+  dec2: 128 → 64,  concat s2 → ConvBlock(128→64)
+  dec1: 64  → 32,  concat s1 → ConvBlock(64→32)
+
+Segmentation head:
+  Conv3d(32, 2, kernel=1) — 1×1×1 conv mapping to 2 output classes
+  (background=0, tumor=1)
+
+Output: logits of shape (B, 2, D, H, W), softmax applied at inference.
+
+4B. BASELINE RESULTS
+---------------------
+Epoch | Val Dice | Val IoU | Val Sensitivity
+------|----------|---------|----------------
+ 10   | 0.3897   |  —      |  —
+ 20   | 0.4858   | 0.3934  | 0.4647
+ 30   | 0.5685   | 0.4478  | 0.7009
+ 40   | 0.5924   | 0.4793  | 0.6090
+ 50   | 0.6035   | 0.4911  | 0.6191  ← LOCKED BASELINE (guide decision 2026-05-19)
+
+4C. FAILURE MODE ANALYSIS (MOTIVATES FADC)
+-------------------------------------------
+DUKE  : Good on large tumors; slight over-segmentation at boundaries.
+ISPY1 : Heavy over-segmentation on large diffuse tumors (many false positives).
+ISPY2 : Consistently misses small tumors — hardest collection.
+NACT  : Best performance — large, bright, well-defined tumors.
+
+Root cause: The fixed dilation=1 ConvBlock has a limited effective receptive
+field. It cannot simultaneously handle small tumors (needs fine detail) and
+large tumors (needs broad context). This is the core motivation for FADC —
+frequency-adaptive dilation that adjusts receptive field based on content.
+
+
+--------------------------------------------------------------------------------
+5. PHASE 1 — STEP 2: 3D U-NET + FADC (PRIMARY MODEL — IN PROGRESS)
+--------------------------------------------------------------------------------
+
+5A. THE 2D FADC PAPER AND WHY WE CANNOT DIRECTLY PORT IT
+----------------------------------------------------------
+
+The original FADC paper (CVPR 2024) introduces a convolution operator whose
+dilation adapts spatially — different locations in the feature map use
+different effective dilation rates based on local frequency content.
+
+The 2D paper achieves this using ModulatedDeformConv2d (mmcv library):
+  - At each spatial location (i,j), a lightweight network predicts an offset
+    delta(i,j) — a 2D vector that shifts the sampling grid of the convolution.
+  - This stretches or compresses the kernel footprint per pixel, effectively
+    changing the local dilation.
+  - The result: one convolution pass with spatially-varying dilation.
+
+THE FUNDAMENTAL PROBLEM FOR 3D:
+  ModulatedDeformConv2d is a 2D-only CUDA kernel in the mmcv library.
+  No 3D deformable convolution exists in mmcv, PyTorch, or any major library.
+  Direct extension is impossible without writing a custom CUDA kernel.
+
+OUR SOLUTION — A 3D REFORMULATION:
+  Instead of one deformable conv with per-pixel adaptive offsets, we run
+  N explicit 3D dilated convolutions in parallel (with fixed dilation rates)
+  and learn a SOFTMAX WEIGHTING over them. The network learns which dilation
+  is most useful for a given input — achieving equivalent frequency-adaptive
+  behavior using only native PyTorch operations.
+
+  2D original   : 1 deformable conv, per-pixel offset → spatially adaptive
+  Our 3D design : N parallel Conv3d, learned branch weights → frequency adaptive
+
+This reformulation is a paper contribution — it is not a trivial port.
+
+
+5B. THE COMPLETE FADC 3D MODULE SYSTEM
+----------------------------------------
+
+The 3D FADC system consists of three modules that work together:
+  1. OmniAttention3D      (fadc_3d/omni_attention_3d.py)
+  2. FrequencySelection3D (fadc_3d/freq_select_3d.py)
+  3. AdaptiveDilatedConv3D (fadc_3d/adaptive_dilated_conv_3d.py)
+
+These three are assembled into FADCConvBlock and used in UNet3DFADC.
+
+
+================================================================================
+MODULE 1: OmniAttention3D
+File: fadc_3d/omni_attention_3d.py
+================================================================================
+
+PURPOSE:
+  Given an input feature map, compute 4 attention signals that control:
+  (a) which input channels are important (channel attention)
+  (b) which output channels are important (filter attention)
+  (c) which kernel positions matter (spatial attention — not used in our config)
+  (d) which dilation branch to trust (kernel/branch attention)
+
+This is the 3D extension of the AdaKern attention module from the FADC paper.
+Every 2D operation is replaced with its 3D equivalent.
+
+ARCHITECTURE:
+  Input: x of shape (B, C_in, D, H, W)
+
+  Step 1 — Global descriptor:
+    AdaptiveAvgPool3d(1)  →  (B, C_in, 1, 1, 1)
+    Conv3d(C_in, C_att, 1) → BatchNorm3d → ReLU
+    where C_att = max(int(C_in × 0.0625), 16)
+    This bottleneck descriptor captures global channel statistics cheaply.
+
+  Step 2 — Branch outputs from the descriptor:
+
+  (a) Channel Attention — c_att:
+      Conv3d(C_att, C_in, 1) → sigmoid → shape (B, C_in, 1, 1, 1)
+      Multiplied with the input: x * c_att
+      Effect: suppresses irrelevant input channels before convolution.
+
+  (b) Filter Attention — f_att:
+      Conv3d(C_att, C_out, 1) → sigmoid → shape (B, C_out, 1, 1, 1)
+      Multiplied with the output after branch fusion.
+      Effect: suppresses irrelevant output feature maps.
+
+  (c) Spatial Attention — s_att:
+      Conv3d(C_att, k³, 1) → sigmoid → shape (B, 1, 1, 1, 1, k, k, k)
+      Modulates individual kernel weight positions.
+      IN OUR CONFIG: kernel_size=1 is passed → spatial attention = 1.0 (skipped).
+      Reason: we do not directly modulate kernel weights; we modulate branch
+      outputs. Spatial attention is redundant here.
+
+  (d) Kernel Attention — k_att:
+      Conv3d(C_att, N_branches, 1) → softmax → shape (B, N_branches, 1, 1, 1)
+      N_branches = 3 (one per dilation: 1, 2, 4)
+      Softmax ensures weights sum to 1 across branches.
+      Effect: the network learns which dilation scale is most useful for the
+      current input — this is the key adaptive mechanism.
+
+INITIALIZATION:
+  All Conv3d: Kaiming normal (mode='fan_out', nonlinearity='relu')
+  All BatchNorm3d: weight=1, bias=0
+
+
+================================================================================
+MODULE 2: FrequencySelection3D
+File: fadc_3d/freq_select_3d.py
+================================================================================
+
+PURPOSE:
+  Decompose the input feature map into frequency bands (low/high frequency
+  components) and apply learnable per-band spatial weights. This re-weights
+  the feature map so that the subsequent dilated convolution branches see a
+  frequency-filtered input — allowing each branch to focus on its most
+  relevant frequency band.
+
+  This is the 3D extension of FrequencySelection from the FADC paper.
+
+KEY 3D CHANGES FROM 2D ORIGINAL:
+  fft2 / ifft2             → fftn / ifftn    (dim=(-3,-2,-1))
+  fftshift on (H,W)        → fftshift on (D,H,W)
+  2D circular/square mask  → 3D cuboid mask  [d0:d1, h0:h1, w0:w1]
+  Conv2d                   → Conv3d
+  ReplicationPad2d         → ReplicationPad3d
+  AvgPool2d                → AvgPool3d
+
+OPERATING MODE: lp_type='freq' (FFT-based, exact)
+  We use FFT-based mode. The avgpool mode was not used because it introduces
+  shape-mismatch bugs at stride=1 in our configuration.
+
+FORWARD PASS (lp_type='freq', k_list=[2]):
+
+  Step 1 — 3D FFT:
+    x_fft = fftshift(fftn(x, dim=(-3,-2,-1), norm='ortho'), dim=(-3,-2,-1))
+    This transforms the feature map to 3D frequency domain and centers
+    the zero-frequency component at the middle of the volume.
+
+  Step 2 — Build 3D cuboid low-pass mask for k=2:
+    The mask isolates the central frequency cube of the FFT output.
+    d0 = round(D/2 - D/(2k)),  d1 = round(D/2 + D/(2k))
+    h0 = round(H/2 - H/(2k)),  h1 = round(H/2 + H/(2k))
+    w0 = round(W/2 - W/(2k)),  w1 = round(W/2 + W/(2k))
+    mask[:, :, d0:d1, h0:h1, w0:w1] = 1.0
+    For k=2: mask covers the central 50% of the frequency volume.
+
+  Step 3 — Extract low and high frequency components:
+    low_part  = ifftn(ifftshift(x_fft * mask)).real  (inverse FFT of masked)
+    high_part = x - low_part                          (residual = high freq)
+
+  Step 4 — Learn per-band spatial weights:
+    freq_weight_conv (Conv3d, depthwise, kernel=3, groups=spatial_group)
+    fw = sigmoid(freq_weight_conv(x)) * 2
+    out = fw * high_part    (weight the high-frequency component)
+
+  Step 5 — Sum contributions:
+    Since lowfreq_att=False (our config): the low-frequency residual is
+    passed through unchanged and added.
+    Final output = weighted high-freq + unweighted low-freq
+
+INITIALIZATION — Zero:
+  All freq_weight_conv weights and biases initialized to zero.
+  At training start: fw = sigmoid(0) * 2 = 1.0 → output = input (identity).
+  Training gradually adjusts the weighting away from identity.
+  This prevents instability in early epochs.
+
+WHY k_list=[2] ONLY (NOT [2,4,8] AS IN THE 2D PAPER):
+  The 2D paper uses k_list=[2,4,8] designed for 512×512 images.
+  Our bottleneck spatial size after 4 downsamples on 128×128×64 is 8×8×4.
+  - k=4: mask covers 2×2×1 voxels in freq domain → near-empty mask
+  - k=8: mask covers 1×1×1 voxel → single DC component, useless
+  Using k=[2] only: mask covers 4×4×2 voxels → meaningful, non-degenerate.
+  This is a critical adaptation for 3D medical imaging with small patch sizes.
+
+
+================================================================================
+MODULE 3: AdaptiveDilatedConv3D
+File: fadc_3d/adaptive_dilated_conv_3d.py
+================================================================================
+
+PURPOSE:
+  The central module. Drop-in replacement for nn.Conv3d (kernel=3, stride=1).
+  Implements the full FADC mechanism in 3D using the two modules above.
+
+ARCHITECTURE OVERVIEW:
+  Input x: (B, C_in, D, H, W)
+  Output:  (B, C_out, D, H, W)  [same spatial size]
+
+  Submodules:
+  - FrequencySelection3D(C_in, k_list=[2], lp_type='freq', lowfreq_att=False)
+  - OmniAttention3D(C_in, C_out, kernel_size=1, kernel_num=3)
+  - 3 × Conv3d branches (dilation 1, 2, 4) in nn.ModuleList
+
+PARALLEL DILATED CONV BRANCHES:
+  For each dilation d in [1, 2, 4]:
+    padding = d * (kernel_size - 1) // 2   (preserves spatial size)
+    Conv3d(C_in, C_out, kernel=3, stride=1, padding=padding, dilation=d, bias=False)
+
+  dilation=1: effective receptive field = 3×3×3
+    Captures fine-grained detail: tumour edges, texture, small structures.
+  dilation=2: effective receptive field = 5×5×5 (with gaps)
+    Captures intermediate context: tumour core, surrounding tissue.
+  dilation=4: effective receptive field = 9×9×9 (with gaps)
+    Captures coarse structure: overall tumour shape, large-scale patterns.
+
+  bias=False in all branches because BatchNorm follows in FADCConvBlock.
+
+5-STEP FORWARD PASS (detailed):
+
+  STEP 1 — Frequency Pre-selection:
+    x_fs = FrequencySelection3D(x)
+    The FFT-based decomposition re-weights the input based on frequency content.
+    x_fs has the same shape as x but with high-frequency components selectively
+    amplified or suppressed. This primes the input so each dilation branch
+    sees the frequency content most suited to its scale.
+
+  STEP 2 — Compute Attention Signals:
+    c_att, f_att, _, k_att = OmniAttention3D(x_fs)
+    c_att : (B, C_in,  1,1,1) — sigmoid weights on input channels
+    f_att : (B, C_out, 1,1,1) — sigmoid weights on output channels
+    k_att : (B, 3,     1,1,1) — softmax weights over 3 dilation branches
+    The underscore is spatial attention — returned as 1.0 (skipped).
+
+  STEP 3 — Channel-gate and run all branches:
+    x_in = x_fs * c_att      (B, C_in, D, H, W)
+    For each branch i: branch_i = Conv3d_i(x_in)    (B, C_out, D, H, W)
+    branch_outs = stack([branch_0, branch_1, branch_2], dim=1)
+                                                     (B, 3, C_out, D, H, W)
+
+  STEP 4 — Attention-weighted branch fusion:
+    k_att has shape (B, 3, 1, 1, 1).
+    Unsqueeze to (B, 3, 1, 1, 1, 1) for broadcast over C_out, D, H, W:
+    out = (branch_outs * k_att.unsqueeze(2)).sum(dim=1)
+                                                     (B, C_out, D, H, W)
+    Interpretation: k_att[b, 0] = how much to use fine detail (d=1)
+                    k_att[b, 1] = how much to use medium context (d=2)
+                    k_att[b, 2] = how much to use coarse structure (d=4)
+    These weights are data-driven — learned during training, vary per sample.
+
+  STEP 5 — Output channel gate:
+    out = out * f_att         (B, C_out, D, H, W)
+    Suppresses unimportant output feature maps.
+
+INITIALIZATION:
+  Conv branches: Kaiming normal (mode='fan_out', nonlinearity='relu')
+  Biases (if any): constant 0
+
+COMPARISON TO 2D FADC:
+  2D FADC: 1 deformable conv, per-pixel offset (continuous, location-specific)
+  Ours:    3 parallel Conv3d, attention weights per feature map (batch-level)
+  The 2D approach is strictly more expressive at test time (per-pixel).
+  Our approach is more practical for 3D (no custom CUDA) and the softmax
+  weighting still provides meaningful frequency-adaptive behavior.
+
+
+================================================================================
+MODULE 4: FADCConvBlock + UNet3DFADC
+File: models/unet_3d_fadc.py
+Parameters: 65,208,326 (65.2M)
+================================================================================
+
+FADCConvBlock:
+  Replaces ConvBlock from the baseline. Structure is identical:
+  AdaptiveDilatedConv3D(in_ch, out_ch, kernel=3, bias=False, fs_cfg=_FS_CFG)
+    → BatchNorm3d(out_ch) → ReLU
+    → AdaptiveDilatedConv3D(out_ch, out_ch, kernel=3, bias=False, fs_cfg=_FS_CFG)
+    → BatchNorm3d(out_ch) → ReLU
+
+  _FS_CFG = dict(k_list=[2], lowfreq_att=False, lp_type='freq',
+                 act='sigmoid', spatial_group=1)
+
+UNet3DFADC Architecture:
+  Identical structure to UNet3D — same depth, same channels, same skip
+  connections, same segmentation head. The ONLY change is ConvBlock →
+  FADCConvBlock at every block (FADC-Full variant).
+
+  Encoder:
+    enc1: FADCConvBlock(1→32),   DownBlock → pool
+    enc2: FADCConvBlock(32→64),  DownBlock → pool
+    enc3: FADCConvBlock(64→128), DownBlock → pool
+    enc4: FADCConvBlock(128→256),DownBlock → pool
+
+  Bottleneck:
+    FADCConvBlock(256→512) at spatial 8×8×4
+
+  Decoder:
+    dec4: UpBlock with FADCConvBlock(512→256)
+    dec3: UpBlock with FADCConvBlock(256→128)
+    dec2: UpBlock with FADCConvBlock(128→64)
+    dec1: UpBlock with FADCConvBlock(64→32)
+
+  Head: Conv3d(32, 2, kernel=1)  [unchanged from baseline]
+
+Why FADC at ALL blocks (not just bottleneck):
+  The hypothesis is that frequency-adaptive convolution benefits all scales —
+  fine detail in early encoder layers, abstract features in the bottleneck,
+  and reconstruction precision in the decoder. The ablation study (bottleneck-
+  only and encoder-only variants) will test whether the full placement is
+  necessary or if gains come primarily from one region.
+
+Parameter count difference:
+  UNet3D:       22.5M parameters
+  UNet3DFADC:   65.2M parameters
+  Increase is due to the 3 parallel conv branches + OmniAttention3D +
+  FrequencySelection3D per conv position.
+
+
+--------------------------------------------------------------------------------
+6. TRAINING SCRIPT — train_centralized.py
+--------------------------------------------------------------------------------
+
+Location: training/train_centralized.py
+
+Key command-line flags:
+  --model unet3d          Train plain 3D U-Net (default)
+  --model unet3d_fadc     Train FADC 3D U-Net
+  --data_root <path>      Root of MAMA-MIA dataset
+  --output_dir <path>     Where to save checkpoints and logs
+  --resume <path>         Resume from a checkpoint (.pth file)
+  --smoke_test            2 epochs, 4 cases, CPU — quick pipeline check
+  --epochs N              Override config epochs
+  --preprocessed_cache_dir  Path to .npz cache (fastest Kaggle loading)
+
+Resume logic (lines 188–195):
+  Loads model weights, optimizer state, and scheduler state from checkpoint.
+  Continues from the saved epoch number.
+  Note: --reset_scheduler is NOT implemented and NOT needed.
+  Starting a fresh FADC run does not use --resume, so no scheduler issue arises.
+
+Smoke test command (local, CPU):
+  cd C:\Users\bhara\Desktop\FADC-main\FADC-main
+  python training/train_centralized.py \
+    --model unet3d_fadc \
+    --smoke_test \
+    --data_root "C:\Users\bhara\Desktop\MAMA_MIA_COMPLETE" \
+    --output_dir outputs/fadc_smoke
+
+Kaggle FADC training command:
+  python training/train_centralized.py \
+    --model unet3d_fadc \
+    --data_root /kaggle/input/.../mama_mia_kaggle_upload \
+    --preprocessed_cache_dir /kaggle/input/mama-mia-preprocessed-cache \
+    --output_dir outputs/fadc_full \
+    --epochs 50
+
+Resume baseline for more epochs (if guide asks):
+  python training/train_centralized.py \
+    --model unet3d \
+    --resume outputs/unet3d_50epochs/latest_checkpoint.pth \
+    --output_dir outputs/unet3d_100epochs \
+    --epochs 100
+
+
+--------------------------------------------------------------------------------
+7. ABLATION PLAN (FOR PAPER)
+--------------------------------------------------------------------------------
+
+All variants: same config, same dataset split, same 50 epochs.
+Only the FADC placement in the U-Net changes.
+
+Variant              | FADC Placement              | Status
+---------------------|-----------------------------|-----------------------
+3D U-Net             | None (standard ConvBlock)   | COMPLETE — Dice 0.6035
+FADC-Full            | All enc + BN + all dec      | IN PROGRESS
+FADC-Bottleneck      | Bottleneck only             | PLANNED
+FADC-Encoder         | Encoder only                | PLANNED
+
+To build FADC-Bottleneck variant:
+  In unet_3d_fadc.py: change enc1–enc4 and dec1–dec4 back to ConvBlock.
+  Keep only the bottleneck as FADCConvBlock.
+
+To build FADC-Encoder variant:
+  Keep enc1–enc4 as FADCConvBlock.
+  Change bottleneck and dec1–dec4 back to ConvBlock.
+
+
+--------------------------------------------------------------------------------
+8. RESULTS TABLE (UPDATED AS TRAINING COMPLETES)
+--------------------------------------------------------------------------------
+
+Model                | Val Dice | Val IoU | Val Sensitivity | Epochs | Status
+---------------------|----------|---------|-----------------|--------|----------
+3D U-Net (baseline)  | 0.6035   | 0.4911  | 0.6191          | 50     | COMPLETE
+FADC-Full            | TBD      | TBD     | TBD             | 50     | PENDING
+FADC-Bottleneck      | TBD      | TBD     | TBD             | 50     | PLANNED
+FADC-Encoder         | TBD      | TBD     | TBD             | 50     | PLANNED
+nnU-Net baseline     | TBD      | TBD     | TBD             | —      | PLANNED
+nnU-Net + FADC       | TBD      | TBD     | TBD             | —      | PLANNED
+
+Target: FADC-Full Val Dice > 0.6035.
+Paper target: Approach MAMA-MIA paper baseline of 0.762.
+
+
+--------------------------------------------------------------------------------
+9. PROJECT FILE STRUCTURE
+--------------------------------------------------------------------------------
+
+FADC-main/FADC-main/
+├── FADC_only/
+│   └── conv_custom.py              2D FADC original (CVPR 2024) — reference only
+├── fadc_3d/
+│   ├── __init__.py
+│   ├── omni_attention_3d.py        OmniAttention3D — 4 attention signals
+│   ├── freq_select_3d.py           FrequencySelection3D — 3D FFT decomposition
+│   └── adaptive_dilated_conv_3d.py AdaptiveDilatedConv3D — core FADC module
+├── models/
+│   ├── unet_3d.py                  3D U-Net baseline (22.5M params)
+│   └── unet_3d_fadc.py             FADC-Full U-Net (65.2M params)
+├── data/
+│   └── mama_mia_dataset.py         Dataset + DataLoader builder
+├── training/
+│   ├── train_centralized.py        Training script (--model flag selects arch)
+│   └── losses.py                   DiceCELoss
+├── scripts/
+│   ├── preprocess_to_cache.py      Builds .npz cache from raw NIfTI
+│   └── evaluate.py                 [TO BUILD] Full evaluation script
+├── configs/
+│   └── config.yaml                 Hyperparameters
+├── outputs/
+│   └── unet3d_50epochs/            Baseline results
+│       ├── best_model.pth
+│       ├── latest_checkpoint.pth
+│       ├── baseline_metrics.txt
+│       ├── train_log.json
+│       ├── training_curves.png
+│       ├── segmentation_results.png
+│       ├── segmentation_per_collection.png
+│       └── per_case_dice.png
+├── kaggle_train_unet3d.ipynb       Kaggle baseline notebook (DO NOT MODIFY — baseline record)
+└── kaggle_train_fadc3dunet.ipynb   Kaggle FADC training notebook ✅
+└── PROJECT_REPORT.txt              This document
+
+
+--------------------------------------------------------------------------------
+10. GITHUB
+--------------------------------------------------------------------------------
+
+Repository : https://github.com/BHARATH-VEMURI/FADC-3D.git
+Visibility : Public
+Status     : All current code pushed
+
+
+--------------------------------------------------------------------------------
+11. REMAINING WORK (IN ORDER)
+--------------------------------------------------------------------------------
+
+IMMEDIATE:
+  [ ] Verify smoke test passes — unet3d_fadc, 2 epochs, CPU (in progress)
+  [ ] Build scripts/evaluate.py — full evaluation with per-collection Dice
+  [x] New Kaggle notebook created: kaggle_train_fadc3dunet.ipynb ✅
+  [ ] Run FADC-Full on Kaggle (50 epochs, T4 x2)
+  [ ] Compare FADC-Full Dice vs 0.6035
+
+AFTER FADC-FULL RESULTS:
+  [ ] Build and train FADC-Bottleneck (ablation 1)
+  [ ] Build and train FADC-Encoder (ablation 2)
+  [ ] Run nnU-Net baseline
+  [ ] Run nnU-Net + FADC
+
+PHASE 2 — FEDERATED LEARNING:
+  [ ] Federated setup with FLWR (Flower framework)
+      4 clients = DUKE, ISPY1, ISPY2, NACT
+      Strategy: FedAvg + FedBN (BatchNorm layers kept local per site)
+      Simulation: sequential clients on same Kaggle machine
+  [ ] Compare federated vs centralized on each collection
+
+
+--------------------------------------------------------------------------------
+12. KEY POINTS FOR PAPER WRITING
+--------------------------------------------------------------------------------
+
+Introduction (what to argue):
+  - Breast MRI tumor segmentation is clinically critical and labor-intensive
+  - Tumor size variation (mm to cm) demands multi-scale receptive fields
+  - FADC (CVPR 2024) addresses this in 2D; no 3D equivalent exists
+  - MAMA-MIA provides the first large-scale multi-center benchmark opportunity
+  - We address both the architectural gap (no 3D FADC) and the deployment
+    gap (no federated learning for multi-center breast MRI)
+
+Methods — contributions to state explicitly:
+  1. First 3D extension of FADC for volumetric MRI
+  2. Novel 3D reformulation: N parallel dilated Conv3d + OmniAttention3D
+     branch weighting — proposed because ModulatedDeformConv2d has no 3D
+     equivalent in any existing library
+  3. 3D cuboid FFT masking for frequency decomposition of volumetric features
+  4. FADC-Full: frequency-adaptive conv at ALL encoder/decoder stages
+  5. [Phase 2] Federated multi-center training preserving site-specific BN
+
+Core technical argument for reviewers:
+  "The 2D FADC paper uses ModulatedDeformConv2d to learn per-pixel adaptive
+  dilation via predicted spatial offsets. Since no 3D deformable convolution
+  exists in any major deep learning library, direct extension is not possible.
+  We propose a 3D reformulation: N parallel Conv3d branches at dilations
+  [1,2,4] are fused via softmax attention weights from OmniAttention3D. The
+  network learns which dilation scale is most informative per input, achieving
+  equivalent frequency-adaptive behavior through learned branch selection
+  rather than learned spatial offsets. This design uses only native PyTorch
+  operations and is compatible with any 3D encoder-decoder architecture."
+
+Metrics to report:
+  - Dice coefficient (primary)
+  - IoU / Jaccard (secondary)
+  - Sensitivity / Recall (secondary)
+  - Per-collection breakdown (DUKE, ISPY1, ISPY2, NACT)
+  - Overall (mean across all validation cases)
+
+Visualizations already generated (baseline):
+  - training_curves.png
+  - segmentation_results.png (sample overlays)
+  - segmentation_per_collection.png (one example per collection)
+  - per_case_dice.png (distribution of per-case Dice)
+
+================================================================================
+END OF REPORT — Last updated: 2026-05-19
+Update this file after every training run or architectural change.
+================================================================================
