@@ -31,12 +31,26 @@ PATCH_SIZE = (128, 128, 64)
 
 # ── Worker — must be module-level for Windows multiprocessing pickle ──────────
 
+def _is_valid_npz(path: str) -> bool:
+    """Return True if the .npz file exists and loads without error."""
+    try:
+        d = np.load(path)
+        _ = d["image"].shape
+        _ = d["label"].shape
+        return True
+    except Exception:
+        return False
+
+
 def _process_one(task: tuple) -> tuple[str, str]:
     """Process one case and save {patient_id}.npz. Returns (patient_id, status)."""
-    patient_id, image_path, label_path, out_path = task
+    patient_id, image_path, label_path, out_path, verify = task
 
     if Path(out_path).exists():
-        return patient_id, "skipped"
+        if not verify or _is_valid_npz(out_path):
+            return patient_id, "skipped"
+        # File exists but is corrupted — delete and reprocess
+        Path(out_path).unlink(missing_ok=True)
 
     try:
         from monai.transforms import (
@@ -88,6 +102,8 @@ def main():
                         help="Path to train_test_splits.csv (auto-detected if omitted)")
     parser.add_argument("--n_jobs",    type=int, default=4,
                         help="Parallel workers (default 4, use 1 to debug)")
+    parser.add_argument("--verify",    action="store_true",
+                        help="Check existing .npz files and reprocess any that are corrupted")
     args = parser.parse_args()
 
     data_root = args.data_root
@@ -111,10 +127,12 @@ def main():
     print(f"Train: {len(train_cases)} | Val: {len(val_cases)} | Total: {len(all_cases)}")
     print(f"Output dir: {out_dir}")
     print(f"Workers: {args.n_jobs}")
+    if args.verify:
+        print("Mode: VERIFY — existing files will be checked and corrupted ones reprocessed")
 
     tasks = [
         (c["patient_id"], c["image"], c["label"],
-         str(dst / f"{c['patient_id']}.npz"))
+         str(dst / f"{c['patient_id']}.npz"), args.verify)
         for c, dst in all_cases
     ]
 
