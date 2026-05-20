@@ -24,7 +24,7 @@ class OmniAttention3D(nn.Module):
 
         self.avgpool = nn.AdaptiveAvgPool3d(1)
         self.fc = nn.Conv3d(in_planes, attention_channel, 1, bias=False)
-        self.bn = nn.BatchNorm3d(attention_channel)
+        self.gn = nn.GroupNorm(1, attention_channel)
         self.relu = nn.ReLU(inplace=True)
 
         self.channel_fc = nn.Conv3d(attention_channel, in_planes, 1, bias=True)
@@ -57,7 +57,7 @@ class OmniAttention3D(nn.Module):
                 nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-            if isinstance(m, nn.BatchNorm3d):
+            if isinstance(m, nn.GroupNorm):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
@@ -90,6 +90,6 @@ class OmniAttention3D(nn.Module):
     def forward(self, x):
         x = self.avgpool(x)
         x = self.fc(x)
-        x = self.bn(x)
+        x = self.gn(x)
         x = self.relu(x)
         return self.func_channel(x), self.func_filter(x), self.func_spatial(x), self.func_kernel(x)
