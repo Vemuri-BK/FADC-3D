@@ -4,10 +4,7 @@ import torch.nn.functional as F
 
 from fadc_3d.adaptive_dilated_conv_3d import AdaptiveDilatedConv3D
 
-
-# k_list=[2] is safe across all spatial sizes, including the bottleneck
-# (8x8x4 after 4 downsamples on a 128x128x64 patch). k_list=[2,4,8] from
-# the 2D paper assumes 512x512+ images and breaks at small depths.
+# k_list=[2] only — prevents empty FFT masks at small 3D bottleneck depths
 _FS_CFG = dict(
     k_list=[2],
     lowfreq_att=False,
@@ -18,11 +15,7 @@ _FS_CFG = dict(
 
 
 class FADCConvBlock(nn.Module):
-    """
-    Two consecutive AdaptiveDilatedConv3D → BN → ReLU layers.
-    Drop-in replacement for the standard ConvBlock in unet_3d.py.
-    bias=False because BatchNorm absorbs any additive constant.
-    """
+    """Two consecutive AdaptiveDilatedConv3D → BN → ReLU layers."""
     def __init__(self, in_ch, out_ch):
         super().__init__()
         self.conv1 = AdaptiveDilatedConv3D(in_ch, out_ch, kernel_size=3, bias=False, fs_cfg=_FS_CFG)
@@ -38,10 +31,31 @@ class FADCConvBlock(nn.Module):
         return x
 
 
-class DownBlock(nn.Module):
+class ConvBlock(nn.Module):
+    """Standard double conv block — identical to unet_3d.py baseline."""
     def __init__(self, in_ch, out_ch):
         super().__init__()
-        self.conv = FADCConvBlock(in_ch, out_ch)
+        self.block = nn.Sequential(
+            nn.Conv3d(in_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv3d(out_ch, out_ch, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm3d(out_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.block(x)
+
+
+def _make_block(in_ch, out_ch, use_fadc):
+    return FADCConvBlock(in_ch, out_ch) if use_fadc else ConvBlock(in_ch, out_ch)
+
+
+class DownBlock(nn.Module):
+    def __init__(self, in_ch, out_ch, use_fadc=False):
+        super().__init__()
+        self.conv = _make_block(in_ch, out_ch, use_fadc)
         self.pool = nn.MaxPool3d(kernel_size=2, stride=2)
 
     def forward(self, x):
@@ -50,10 +64,10 @@ class DownBlock(nn.Module):
 
 
 class UpBlock(nn.Module):
-    def __init__(self, in_ch, out_ch):
+    def __init__(self, in_ch, out_ch, use_fadc=False):
         super().__init__()
         self.up   = nn.ConvTranspose3d(in_ch, out_ch, kernel_size=2, stride=2)
-        self.conv = FADCConvBlock(in_ch, out_ch)
+        self.conv = _make_block(in_ch, out_ch, use_fadc)
 
     def forward(self, x, skip):
         x = self.up(x)
@@ -65,37 +79,40 @@ class UpBlock(nn.Module):
 
 class UNet3DFADC(nn.Module):
     """
-    3D U-Net with Frequency-Adaptive Dilated Convolution at every
-    encoder, bottleneck, and decoder block (FADC-Full variant).
+    3D U-Net with Frequency-Adaptive Dilated Convolution.
 
-    Architecture is identical to UNet3D (unet_3d.py) — same depth,
-    same channel widths, same skip connections — with ConvBlock
-    replaced by FADCConvBlock throughout.
+    fadc_placement controls where FADC blocks are used:
+      'full'       — encoder + bottleneck + decoder  (FADC-Full)
+      'encoder'    — encoder only                    (FADC-Encoder ablation)
+      'bottleneck' — bottleneck only                 (FADC-Bottleneck ablation)
 
-    For the ablation study:
-      - This file  →  FADC-Full  (primary model)
-      - Bottleneck-only variant  →  swap enc/dec blocks back to ConvBlock
+    Architecture depth and channel widths are identical across all placements —
+    only the conv block type changes, making this a clean ablation.
     """
-    def __init__(self, in_channels=1, out_channels=2, base_filters=32):
+    def __init__(self, in_channels=1, out_channels=2, base_filters=32,
+                 fadc_placement='full'):
         super().__init__()
+        assert fadc_placement in ('full', 'encoder', 'bottleneck'), \
+            f"fadc_placement must be 'full', 'encoder', or 'bottleneck', got '{fadc_placement}'"
+
+        enc_fadc = fadc_placement in ('full', 'encoder')
+        bn_fadc  = fadc_placement in ('full', 'bottleneck')
+        dec_fadc = fadc_placement in ('full',)
 
         f = base_filters
-        # Encoder
-        self.enc1 = DownBlock(in_channels, f)        # 128x128x64 → skip(f),   pool → 64x64x32
-        self.enc2 = DownBlock(f,      f * 2)          # 64x64x32   → skip(2f),  pool → 32x32x16
-        self.enc3 = DownBlock(f * 2,  f * 4)          # 32x32x16   → skip(4f),  pool → 16x16x8
-        self.enc4 = DownBlock(f * 4,  f * 8)          # 16x16x8    → skip(8f),  pool → 8x8x4
 
-        # Bottleneck
-        self.bottleneck = FADCConvBlock(f * 8, f * 16)  # 8x8x4 → 16f channels
+        self.enc1 = DownBlock(in_channels, f,     use_fadc=enc_fadc)
+        self.enc2 = DownBlock(f,      f * 2,      use_fadc=enc_fadc)
+        self.enc3 = DownBlock(f * 2,  f * 4,      use_fadc=enc_fadc)
+        self.enc4 = DownBlock(f * 4,  f * 8,      use_fadc=enc_fadc)
 
-        # Decoder
-        self.dec4 = UpBlock(f * 16, f * 8)
-        self.dec3 = UpBlock(f * 8,  f * 4)
-        self.dec2 = UpBlock(f * 4,  f * 2)
-        self.dec1 = UpBlock(f * 2,  f)
+        self.bottleneck = _make_block(f * 8, f * 16, use_fadc=bn_fadc)
 
-        # Segmentation head — plain 1x1 conv, no FADC needed
+        self.dec4 = UpBlock(f * 16, f * 8,  use_fadc=dec_fadc)
+        self.dec3 = UpBlock(f * 8,  f * 4,  use_fadc=dec_fadc)
+        self.dec2 = UpBlock(f * 4,  f * 2,  use_fadc=dec_fadc)
+        self.dec1 = UpBlock(f * 2,  f,      use_fadc=dec_fadc)
+
         self.head = nn.Conv3d(f, out_channels, kernel_size=1)
 
     def forward(self, x):
@@ -115,17 +132,12 @@ class UNet3DFADC(nn.Module):
 
 
 if __name__ == '__main__':
-    model = UNet3DFADC(in_channels=1, out_channels=2, base_filters=32)
-
-    total = sum(p.numel() for p in model.parameters())
-    print(f"Parameters: {total:,}")
-
-    x = torch.randn(1, 1, 128, 128, 64)
-    print(f"Input:  {x.shape}")
-
-    with torch.no_grad():
-        y = model(x)
-
-    print(f"Output: {y.shape}")
-    assert y.shape == (1, 2, 128, 128, 64), "Shape mismatch!"
-    print("Forward pass OK.")
+    for placement in ('full', 'encoder', 'bottleneck'):
+        model = UNet3DFADC(in_channels=1, out_channels=2, base_filters=32,
+                           fadc_placement=placement)
+        total = sum(p.numel() for p in model.parameters())
+        x = torch.randn(1, 1, 96, 96, 48)
+        with torch.no_grad():
+            y = model(x)
+        assert y.shape == (1, 2, 96, 96, 48)
+        print(f"placement={placement:12s} | params={total:,} | output={y.shape} OK")

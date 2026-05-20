@@ -47,7 +47,8 @@ def parse_args():
     parser.add_argument("--smoke_test",  action="store_true",
                         help="Run 2 epochs on 4 cases to verify pipeline end-to-end")
     parser.add_argument("--model",       type=str, default="unet3d",
-                        choices=["unet3d", "unet3d_fadc"],
+                        choices=["unet3d", "unet3d_fadc",
+                                 "unet3d_fadc_encoder", "unet3d_fadc_bottleneck"],
                         help="Model architecture to train")
     parser.add_argument("--patch_size",  type=int, nargs=3, default=None,
                         metavar=("X", "Y", "Z"),
@@ -172,7 +173,11 @@ def train(cfg, args):
         base_filters=cfg["model"]["base_filters"],
     )
     if args.model == "unet3d_fadc":
-        model = UNet3DFADC(**model_kwargs).to(device)
+        model = UNet3DFADC(**model_kwargs, fadc_placement='full').to(device)
+    elif args.model == "unet3d_fadc_encoder":
+        model = UNet3DFADC(**model_kwargs, fadc_placement='encoder').to(device)
+    elif args.model == "unet3d_fadc_bottleneck":
+        model = UNet3DFADC(**model_kwargs, fadc_placement='bottleneck').to(device)
     else:
         model = UNet3D(**model_kwargs).to(device)
 
