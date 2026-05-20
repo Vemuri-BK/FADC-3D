@@ -15,4 +15,4 @@ training:
   lr: 1.0e-4
   dice_weight: 0.5
   ce_weight: 0.5
-  val_every: 10         # run validation every N epochs
+  val_every: 25         # run validation every N epochs

@@ -95,7 +95,7 @@ def validate(model, val_loader, dice_metric, post_pred, post_label, patch_size, 
                     roi_size=patch_size,
                     sw_batch_size=4,
                     predictor=model,
-                    overlap=0.25,
+                    overlap=0.0,
                 )
 
             preds_bin  = [post_pred(i)          for i in decollate_batch(preds)]
