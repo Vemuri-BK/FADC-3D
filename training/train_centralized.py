@@ -53,6 +53,8 @@ def parse_args():
     parser.add_argument("--patch_size",  type=int, nargs=3, default=None,
                         metavar=("X", "Y", "Z"),
                         help="Override patch size, e.g. --patch_size 96 96 48")
+    parser.add_argument("--warmup_epochs", type=int, default=5,
+                        help="Linear LR warmup epochs (0 to disable)")
     return parser.parse_args()
 
 
@@ -190,8 +192,21 @@ def train(cfg, args):
         ce_weight=cfg["training"]["ce_weight"],
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
-    scaler    = GradScaler("cuda", enabled=device.type == "cuda")
+
+    warmup_epochs = args.warmup_epochs
+    if warmup_epochs > 0 and epochs > warmup_epochs:
+        warmup_sched = torch.optim.lr_scheduler.LinearLR(
+            optimizer, start_factor=0.1, total_iters=warmup_epochs)
+        cosine_sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=epochs - warmup_epochs, eta_min=1e-6)
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer, schedulers=[warmup_sched, cosine_sched],
+            milestones=[warmup_epochs])
+    else:
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=epochs, eta_min=1e-6)
+
+    scaler = GradScaler("cuda", enabled=device.type == "cuda")
 
     # ── Metrics ───────────────────────────────
     dice_metric = DiceMetric(include_background=False, reduction="mean")

@@ -15,7 +15,14 @@ _FS_CFG = dict(
 
 
 class FADCConvBlock(nn.Module):
-    """Two consecutive AdaptiveDilatedConv3D → BN → ReLU layers."""
+    """Two consecutive AdaptiveDilatedConv3D → BN → ReLU with residual connection.
+
+    The original 2D FADC was designed for ResNet/FPN backbones that already have
+    residual connections. Without a skip path, the entire signal must traverse
+    the complex FADC pipeline (FreqSelect → OmniAtt → multi-branch → gating),
+    causing poor gradient flow. The residual lets FADC learn a refinement on top
+    of an identity-like baseline.
+    """
     def __init__(self, in_ch, out_ch):
         super().__init__()
         self.conv1 = AdaptiveDilatedConv3D(in_ch, out_ch, kernel_size=3, bias=False, fs_cfg=_FS_CFG)
@@ -25,10 +32,19 @@ class FADCConvBlock(nn.Module):
         self.bn2   = nn.BatchNorm3d(out_ch)
         self.relu2 = nn.ReLU(inplace=True)
 
+        if in_ch != out_ch:
+            self.skip_proj = nn.Sequential(
+                nn.Conv3d(in_ch, out_ch, kernel_size=1, bias=False),
+                nn.BatchNorm3d(out_ch),
+            )
+        else:
+            self.skip_proj = nn.Identity()
+
     def forward(self, x):
-        x = self.relu1(self.bn1(self.conv1(x)))
-        x = self.relu2(self.bn2(self.conv2(x)))
-        return x
+        identity = self.skip_proj(x)
+        out = self.relu1(self.bn1(self.conv1(x)))
+        out = self.bn2(self.conv2(out))
+        return self.relu2(out + identity)
 
 
 class ConvBlock(nn.Module):

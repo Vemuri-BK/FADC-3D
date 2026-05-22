@@ -104,7 +104,9 @@ class AdaptiveDilatedConv3D(nn.Module):
         # k_att: (b, num_branches, 1,1,1)
 
         # Step 3 — channel-gate the input, then run all dilation branches
-        x_in = x_fs * c_att
+        # Multiply by 2 to compensate sigmoid's 0.5 average: sigmoid(0)→0, sigmoid(∞)→2, avg→1.0
+        # (matches original 2D FADC: weight_mean * (c_att * 2) * (f_att * 2))
+        x_in = x_fs * (c_att * 2)
         branch_outs = torch.stack([conv(x_in) for conv in self.conv_branches], dim=1)
         # branch_outs: (b, num_branches, out_channels, d, h, w)
 
@@ -112,8 +114,8 @@ class AdaptiveDilatedConv3D(nn.Module):
         out = (branch_outs * k_att.unsqueeze(2)).sum(dim=1)
         # out: (b, out_channels, d, h, w)
 
-        # Step 5 — filter-gate the output
-        out = out * f_att
+        # Step 5 — filter-gate the output (sigmoid * 2 compensation)
+        out = out * (f_att * 2)
         return out
 
 
