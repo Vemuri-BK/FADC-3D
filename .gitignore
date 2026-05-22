@@ -25,6 +25,10 @@ kaggle.json
 .env
 *.log
 
+# Local-only documents
+PROJECT_REPORT.txt
+PAPER_DRAFT_IEEE.txt
+
 # OS
 .DS_Store
 Thumbs.db
