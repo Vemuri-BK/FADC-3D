@@ -15,19 +15,13 @@ _FS_CFG = dict(
 
 
 class FADCConvBlock(nn.Module):
-    """Two consecutive AdaptiveDilatedConv3D → BN → ReLU with residual connection.
-
-    The original 2D FADC was designed for ResNet/FPN backbones that already have
-    residual connections. Without a skip path, the entire signal must traverse
-    the complex FADC pipeline (FreqSelect → OmniAtt → multi-branch → gating),
-    causing poor gradient flow. The residual lets FADC learn a refinement on top
-    of an identity-like baseline.
-    """
-    def __init__(self, in_ch, out_ch):
+    """Two consecutive AdaptiveDilatedConv3D → BN → ReLU with residual connection."""
+    def __init__(self, in_ch, out_ch, dropout=0.15):
         super().__init__()
         self.conv1 = AdaptiveDilatedConv3D(in_ch, out_ch, kernel_size=3, bias=False, fs_cfg=_FS_CFG)
         self.bn1   = nn.BatchNorm3d(out_ch)
         self.relu1 = nn.ReLU(inplace=True)
+        self.drop1 = nn.Dropout3d(p=dropout)
         self.conv2 = AdaptiveDilatedConv3D(out_ch, out_ch, kernel_size=3, bias=False, fs_cfg=_FS_CFG)
         self.bn2   = nn.BatchNorm3d(out_ch)
         self.relu2 = nn.ReLU(inplace=True)
@@ -42,7 +36,7 @@ class FADCConvBlock(nn.Module):
 
     def forward(self, x):
         identity = self.skip_proj(x)
-        out = self.relu1(self.bn1(self.conv1(x)))
+        out = self.drop1(self.relu1(self.bn1(self.conv1(x))))
         out = self.bn2(self.conv2(out))
         return self.relu2(out + identity)
 
@@ -101,6 +95,7 @@ class UNet3DFADC(nn.Module):
       'full'       — encoder + bottleneck + decoder  (FADC-Full)
       'encoder'    — encoder only                    (FADC-Encoder ablation)
       'bottleneck' — bottleneck only                 (FADC-Bottleneck ablation)
+      'mid'        — enc2 + enc3 only                (FADC-Mid — selective placement)
 
     Architecture depth and channel widths are identical across all placements —
     only the conv block type changes, making this a clean ablation.
@@ -108,8 +103,8 @@ class UNet3DFADC(nn.Module):
     def __init__(self, in_channels=1, out_channels=2, base_filters=32,
                  fadc_placement='full'):
         super().__init__()
-        assert fadc_placement in ('full', 'encoder', 'bottleneck'), \
-            f"fadc_placement must be 'full', 'encoder', or 'bottleneck', got '{fadc_placement}'"
+        assert fadc_placement in ('full', 'encoder', 'bottleneck', 'mid'), \
+            f"fadc_placement must be 'full', 'encoder', 'bottleneck', or 'mid', got '{fadc_placement}'"
 
         enc_fadc = fadc_placement in ('full', 'encoder')
         bn_fadc  = fadc_placement in ('full', 'bottleneck')
@@ -117,10 +112,16 @@ class UNet3DFADC(nn.Module):
 
         f = base_filters
 
-        self.enc1 = DownBlock(in_channels, f,     use_fadc=enc_fadc)
-        self.enc2 = DownBlock(f,      f * 2,      use_fadc=enc_fadc)
-        self.enc3 = DownBlock(f * 2,  f * 4,      use_fadc=enc_fadc)
-        self.enc4 = DownBlock(f * 4,  f * 8,      use_fadc=enc_fadc)
+        if fadc_placement == 'mid':
+            self.enc1 = DownBlock(in_channels, f,     use_fadc=False)
+            self.enc2 = DownBlock(f,      f * 2,      use_fadc=True)
+            self.enc3 = DownBlock(f * 2,  f * 4,      use_fadc=True)
+            self.enc4 = DownBlock(f * 4,  f * 8,      use_fadc=False)
+        else:
+            self.enc1 = DownBlock(in_channels, f,     use_fadc=enc_fadc)
+            self.enc2 = DownBlock(f,      f * 2,      use_fadc=enc_fadc)
+            self.enc3 = DownBlock(f * 2,  f * 4,      use_fadc=enc_fadc)
+            self.enc4 = DownBlock(f * 4,  f * 8,      use_fadc=enc_fadc)
 
         self.bottleneck = _make_block(f * 8, f * 16, use_fadc=bn_fadc)
 
@@ -148,7 +149,7 @@ class UNet3DFADC(nn.Module):
 
 
 if __name__ == '__main__':
-    for placement in ('full', 'encoder', 'bottleneck'):
+    for placement in ('full', 'encoder', 'bottleneck', 'mid'):
         model = UNet3DFADC(in_channels=1, out_channels=2, base_filters=32,
                            fadc_placement=placement)
         total = sum(p.numel() for p in model.parameters())

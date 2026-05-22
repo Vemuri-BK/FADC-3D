@@ -20,10 +20,9 @@ class AdaptiveDilatedConv3D(nn.Module):
                                  This filters the signal before the conv sees it,
                                  letting each dilation branch focus on the right band.
       2. Channel attention      — from OmniAttention3D; rescales input channels.
-      3. N dilated Conv3d branches (dilation_list=[1,2,4] by default).
+      3. N dilated Conv3d branches (dilation_list=[1,2] by default).
          dilation=1 → high-freq details (tumour boundary, texture).
          dilation=2 → mid-range context.
-         dilation=4 → low-freq structure (overall tumour shape).
       4. Kernel attention       — softmax weights over the N branch outputs.
          The network learns which dilation is most useful per location / feature map.
       5. Filter attention       — rescales output channels.
@@ -44,7 +43,7 @@ class AdaptiveDilatedConv3D(nn.Module):
                  fs_cfg=None):
         super().__init__()
         if dilation_list is None:
-            dilation_list = [1, 2, 4]
+            dilation_list = [1, 2]
 
         self.in_channels = in_channels
         self.out_channels = out_channels
