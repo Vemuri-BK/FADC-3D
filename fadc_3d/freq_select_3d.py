@@ -110,14 +110,14 @@ class FrequencySelection3D(nn.Module):
 
         elif self.lp_type == 'freq':
             pre_x = x.clone()
-            # 3D FFT: shift zero-frequency to centre of the volume
+            # FFT requires float32 — ComplexHalf (from AMP float16) is unsupported
+            x_f32 = x.float()
             x_fft = torch.fft.fftshift(
-                torch.fft.fftn(x, dim=(-3, -2, -1), norm='ortho'),
+                torch.fft.fftn(x_f32, dim=(-3, -2, -1), norm='ortho'),
                 dim=(-3, -2, -1))
 
             for idx, freq in enumerate(self.k_list):
-                # Cuboid low-pass mask centred in the 3D frequency domain
-                mask = torch.zeros_like(x[:, 0:1], device=x.device)
+                mask = torch.zeros(b, 1, d, h, w, device=x.device)
                 d0, d1 = round(d/2 - d/(2*freq)), round(d/2 + d/(2*freq))
                 h0, h1 = round(h/2 - h/(2*freq)), round(h/2 + h/(2*freq))
                 w0, w1 = round(w/2 - w/(2*freq)), round(w/2 + w/(2*freq))
@@ -125,7 +125,7 @@ class FrequencySelection3D(nn.Module):
 
                 low_part = torch.fft.ifftn(
                     torch.fft.ifftshift(x_fft * mask, dim=(-3, -2, -1)),
-                    dim=(-3, -2, -1), norm='ortho').real
+                    dim=(-3, -2, -1), norm='ortho').real.to(x.dtype)
                 high_part = pre_x - low_part
                 pre_x = low_part
 
