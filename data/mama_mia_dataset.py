@@ -130,6 +130,42 @@ def discover_cases(data_root: str, split_csv: str = None, split: str = "train") 
     return cases
 
 
+def discover_cases_from_cache(cache_dir: str, split_csv: str = None, split: str = "train") -> list[dict]:
+    """
+    List .npz files in cache_dir and filter by the official split CSV if provided.
+
+    Used when training from the preprocessed cache — does NOT require the raw
+    NIfTI dataset to be mounted. Each .npz already contains the 2-channel image
+    and label, so we only need patient_id, collection, and client_id per case.
+    """
+    cache_path = Path(cache_dir)
+    if not cache_path.exists():
+        return []
+
+    split_ids = None
+    if split_csv and os.path.exists(split_csv):
+        df = pd.read_csv(split_csv)
+        col = "train_split" if split == "train" else "test_split"
+        split_ids = set(df[col].dropna().astype(str).str.lower())
+
+    cases = []
+    for npz_path in sorted(cache_path.glob("*.npz")):
+        patient_id = npz_path.stem.lower()           # e.g. duke_001
+        collection = patient_id.split("_")[0].upper()  # e.g. DUKE
+
+        if collection not in COLLECTIONS:
+            continue
+        if split_ids is not None and patient_id not in split_ids:
+            continue
+
+        cases.append({
+            "patient_id": patient_id,
+            "collection": collection,
+            "client_id":  CLIENT_MAP[collection],
+        })
+    return cases
+
+
 # ─────────────────────────────────────────────
 # 2. TRANSFORMS
 # ─────────────────────────────────────────────
@@ -272,13 +308,19 @@ class PreprocessedDataset(Dataset):
             if self.transform is not None:
                 item = self.transform(item)
             return item
-        except Exception:
-            # Corrupted .npz — fall back to raw NIfTI loading for this case
+        except Exception as e:
+            # Cases discovered from the cache don't carry raw NIfTI paths, so we can't
+            # fall back here. Fail loudly — a corrupted .npz means the cache needs re-upload.
+            case = self.cases[idx]
+            if "image_pre" not in case or "image_post" not in case:
+                raise RuntimeError(
+                    f"Failed to load cached .npz for {patient_id} at {npz_path} ({e}). "
+                    f"The cache file is missing or corrupted — re-upload the preprocessed cache."
+                ) from e
             import warnings
             warnings.warn(f"Corrupted cache for {patient_id}, falling back to NIfTI load")
             fallback = get_train_transforms(self.patch_size) if self.is_train else get_val_transforms()
-            result = fallback(self.cases[idx])
-            # Strip extra keys so structure matches the .npz path (image+label only)
+            result = fallback(case)
             if isinstance(result, list):
                 return [{"image": p["image"], "label": p["label"]} for p in result]
             return {"image": result["image"], "label": result["label"]}
@@ -308,50 +350,57 @@ def build_centralized_loaders(
     persistent_cache_dir: MONAI PersistentDataset cache (preprocess once to disk per session).
     cache_rate=0.0: no caching — slowest but works anywhere.
     """
-    train_cases = discover_cases(data_root, split_csv, split="train")
-    val_cases   = discover_cases(data_root, split_csv, split="test")
-
-    if max_cases is not None:
-        train_cases = train_cases[:max_cases]
-        val_cases   = val_cases[:max_cases]
-
-    print(f"Train cases: {len(train_cases)} | Val cases: {len(val_cases)}")
-
     if preprocessed_cache_dir:
+        # Cache path: list patient_ids from .npz files — raw NIfTI dataset not needed.
         train_cache = os.path.join(preprocessed_cache_dir, "train")
         val_cache   = os.path.join(preprocessed_cache_dir, "val")
+        train_cases = discover_cases_from_cache(train_cache, split_csv, split="train")
+        val_cases   = discover_cases_from_cache(val_cache,   split_csv, split="test")
+        if max_cases is not None:
+            train_cases = train_cases[:max_cases]
+            val_cases   = val_cases[:max_cases]
+        print(f"Train cases: {len(train_cases)} | Val cases: {len(val_cases)}")
         print(f"Using preprocessed .npz cache: {preprocessed_cache_dir}")
         train_ds = PreprocessedDataset(train_cache, train_cases, is_train=True,  patch_size=patch_size)
         val_ds   = PreprocessedDataset(val_cache,   val_cases,   is_train=False, patch_size=patch_size)
-    elif persistent_cache_dir:
-        train_cache = os.path.join(persistent_cache_dir, "train")
-        val_cache   = os.path.join(persistent_cache_dir, "val")
-        os.makedirs(train_cache, exist_ok=True)
-        os.makedirs(val_cache,   exist_ok=True)
-        print(f"Using PersistentDataset cache: {persistent_cache_dir}")
-        train_ds = PersistentDataset(
-            data=train_cases,
-            transform=get_train_transforms(patch_size),
-            cache_dir=train_cache,
-        )
-        val_ds = PersistentDataset(
-            data=val_cases,
-            transform=get_val_transforms(),
-            cache_dir=val_cache,
-        )
     else:
-        train_ds = CacheDataset(
-            data=train_cases,
-            transform=get_train_transforms(patch_size),
-            cache_rate=cache_rate,
-            num_workers=num_workers,
-        )
-        val_ds = CacheDataset(
-            data=val_cases,
-            transform=get_val_transforms(),
-            cache_rate=cache_rate,
-            num_workers=num_workers,
-        )
+        # Raw NIfTI path: needs the raw dataset with both _0000 and _0001 phases.
+        train_cases = discover_cases(data_root, split_csv, split="train")
+        val_cases   = discover_cases(data_root, split_csv, split="test")
+        if max_cases is not None:
+            train_cases = train_cases[:max_cases]
+            val_cases   = val_cases[:max_cases]
+        print(f"Train cases: {len(train_cases)} | Val cases: {len(val_cases)}")
+
+        if persistent_cache_dir:
+            train_cache = os.path.join(persistent_cache_dir, "train")
+            val_cache   = os.path.join(persistent_cache_dir, "val")
+            os.makedirs(train_cache, exist_ok=True)
+            os.makedirs(val_cache,   exist_ok=True)
+            print(f"Using PersistentDataset cache: {persistent_cache_dir}")
+            train_ds = PersistentDataset(
+                data=train_cases,
+                transform=get_train_transforms(patch_size),
+                cache_dir=train_cache,
+            )
+            val_ds = PersistentDataset(
+                data=val_cases,
+                transform=get_val_transforms(),
+                cache_dir=val_cache,
+            )
+        else:
+            train_ds = CacheDataset(
+                data=train_cases,
+                transform=get_train_transforms(patch_size),
+                cache_rate=cache_rate,
+                num_workers=num_workers,
+            )
+            val_ds = CacheDataset(
+                data=val_cases,
+                transform=get_val_transforms(),
+                cache_rate=cache_rate,
+                num_workers=num_workers,
+            )
 
     train_loader = MonaiLoader(train_ds, batch_size=batch_size, shuffle=True,
                                num_workers=num_workers, collate_fn=_safe_collate,
