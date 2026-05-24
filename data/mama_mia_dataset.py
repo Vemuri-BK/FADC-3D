@@ -23,6 +23,8 @@ from monai.transforms import (
     RandRotate90d,
     RandScaleIntensityd,
     RandShiftIntensityd,
+    ConcatItemsd,
+    DeleteItemsd,
     EnsureTyped,
     ToTensord,
 )
@@ -98,21 +100,27 @@ def discover_cases(data_root: str, split_csv: str = None, split: str = "train") 
         if split_ids is not None and patient_id not in split_ids:
             continue
 
-        # Post-contrast phase 1 as input (_0001)
-        # Support both .nii.gz (local) and .nii (Kaggle unzips to .nii)
-        image_path = patient_folder / f"{patient_id}_0001.nii.gz"
-        if not image_path.exists():
-            image_path = patient_folder / f"{patient_id}_0001.nii"
+        # Two channels: pre-contrast (_0000) + post-contrast phase 1 (_0001).
+        # The pre→post subtraction is the actual DCE-MRI enhancement signal —
+        # giving the model both phases lets it learn the optimal combination.
+        pre_path = patient_folder / f"{patient_id}_0000.nii.gz"
+        if not pre_path.exists():
+            pre_path = patient_folder / f"{patient_id}_0000.nii"
+
+        post_path = patient_folder / f"{patient_id}_0001.nii.gz"
+        if not post_path.exists():
+            post_path = patient_folder / f"{patient_id}_0001.nii"
 
         seg_path = seg_dir / f"{patient_id}.nii.gz"
         if not seg_path.exists():
             seg_path = seg_dir / f"{patient_id}.nii"
 
-        if not image_path.exists() or not seg_path.exists():
+        if not pre_path.exists() or not post_path.exists() or not seg_path.exists():
             continue
 
         cases.append({
-            "image":       str(image_path),
+            "image_pre":   str(pre_path),
+            "image_post":  str(post_path),
             "label":       str(seg_path),
             "patient_id":  patient_id,
             "collection":  collection,
@@ -132,38 +140,31 @@ POS_NEG_RATIO = 1                     # 1:1 — half patches centered on tumor, 
 
 def get_train_transforms(patch_size=None):
     ps = tuple(patch_size) if patch_size is not None else DEFAULT_PATCH_SIZE
+    img_keys = ["image_pre", "image_post"]
+    all_keys = img_keys + ["label"]
     return Compose([
-        # Load NIfTI files from disk
-        LoadImaged(keys=["image", "label"]),
-
-        # Add channel dim: (H,W,D) → (1,H,W,D)
-        EnsureChannelFirstd(keys=["image", "label"]),
-
-        # Reorient all scans to RAS standard axes
-        Orientationd(keys=["image", "label"], axcodes="RAS"),
-
-        # Resample to 1x1x1 mm isotropic spacing
+        LoadImaged(keys=all_keys),
+        EnsureChannelFirstd(keys=all_keys),
+        Orientationd(keys=all_keys, axcodes="RAS"),
         Spacingd(
-            keys=["image", "label"],
+            keys=all_keys,
             pixdim=(1.0, 1.0, 1.0),
-            mode=("bilinear", "nearest"),   # bilinear for image, nearest for mask
+            mode=("bilinear", "bilinear", "nearest"),
         ),
-
-        # Clip to 1st-99th percentile then scale to [0, 1]
+        # Per-channel intensity normalization — pre and post have different ranges
         ScaleIntensityRangePercentilesd(
-            keys=["image"],
+            keys=img_keys,
             lower=1, upper=99,
             b_min=0.0, b_max=1.0,
             clip=True,
         ),
+        # Use post-contrast for foreground crop (brighter, more signal)
+        CropForegroundd(keys=all_keys, source_key="image_post"),
+        # Stack pre + post into a single 2-channel "image"
+        ConcatItemsd(keys=img_keys, name="image", dim=0),
+        DeleteItemsd(keys=img_keys),
 
-        # Remove black background — crop tight around non-zero voxels
-        CropForegroundd(keys=["image", "label"], source_key="image"),
-
-        # Ensure volume is at least patch size
         SpatialPadd(keys=["image", "label"], spatial_size=ps),
-
-        # Random patch: 50% centered on tumor, 50% random background
         RandCropByPosNegLabeld(
             keys=["image", "label"],
             label_key="label",
@@ -175,7 +176,6 @@ def get_train_transforms(patch_size=None):
             image_threshold=0,
         ),
 
-        # Augmentation — simulate scanner variation across sites
         RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=0),
         RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=1),
         RandFlipd(keys=["image", "label"], prob=0.5, spatial_axis=2),
@@ -188,22 +188,26 @@ def get_train_transforms(patch_size=None):
 
 
 def get_val_transforms():
+    img_keys = ["image_pre", "image_post"]
+    all_keys = img_keys + ["label"]
     return Compose([
-        LoadImaged(keys=["image", "label"]),
-        EnsureChannelFirstd(keys=["image", "label"]),
-        Orientationd(keys=["image", "label"], axcodes="RAS"),
+        LoadImaged(keys=all_keys),
+        EnsureChannelFirstd(keys=all_keys),
+        Orientationd(keys=all_keys, axcodes="RAS"),
         Spacingd(
-            keys=["image", "label"],
+            keys=all_keys,
             pixdim=(1.0, 1.0, 1.0),
-            mode=("bilinear", "nearest"),
+            mode=("bilinear", "bilinear", "nearest"),
         ),
         ScaleIntensityRangePercentilesd(
-            keys=["image"],
+            keys=img_keys,
             lower=1, upper=99,
             b_min=0.0, b_max=1.0,
             clip=True,
         ),
-        CropForegroundd(keys=["image", "label"], source_key="image"),
+        CropForegroundd(keys=all_keys, source_key="image_post"),
+        ConcatItemsd(keys=img_keys, name="image", dim=0),
+        DeleteItemsd(keys=img_keys),
         EnsureTyped(keys=["image", "label"]),
     ])
 

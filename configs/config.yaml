@@ -1,5 +1,5 @@
 model:
-  in_channels: 1        # post-contrast phase 1 only
+  in_channels: 2        # 2 channels: pre-contrast (_0000) + post-contrast phase 1 (_0001)
   out_channels: 2       # background + tumor
   base_filters: 32      # feature maps at first encoder level
 

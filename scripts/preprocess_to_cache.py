@@ -43,8 +43,9 @@ def _is_valid_npz(path: str) -> bool:
 
 
 def _process_one(task: tuple) -> tuple[str, str]:
-    """Process one case and save {patient_id}.npz. Returns (patient_id, status)."""
-    patient_id, image_path, label_path, out_path, verify = task
+    """Process one case and save {patient_id}.npz with 2-channel image
+    (pre-contrast + post-contrast phase 1). Returns (patient_id, status)."""
+    patient_id, image_pre, image_post, label_path, out_path, verify = task
 
     if Path(out_path).exists():
         if not verify or _is_valid_npz(out_path):
@@ -56,28 +57,37 @@ def _process_one(task: tuple) -> tuple[str, str]:
         from monai.transforms import (
             Compose, LoadImaged, EnsureChannelFirstd, Orientationd,
             Spacingd, ScaleIntensityRangePercentilesd, CropForegroundd,
-            SpatialPadd, EnsureTyped,
+            SpatialPadd, ConcatItemsd, DeleteItemsd, EnsureTyped,
         )
 
+        img_keys = ["image_pre", "image_post"]
+        all_keys = img_keys + ["label"]
+
         transform = Compose([
-            LoadImaged(keys=["image", "label"]),
-            EnsureChannelFirstd(keys=["image", "label"]),
-            Orientationd(keys=["image", "label"], axcodes="RAS"),
+            LoadImaged(keys=all_keys),
+            EnsureChannelFirstd(keys=all_keys),
+            Orientationd(keys=all_keys, axcodes="RAS"),
             Spacingd(
-                keys=["image", "label"],
+                keys=all_keys,
                 pixdim=(1.0, 1.0, 1.0),
-                mode=("bilinear", "nearest"),
+                mode=("bilinear", "bilinear", "nearest"),
             ),
             ScaleIntensityRangePercentilesd(
-                keys=["image"], lower=1, upper=99,
+                keys=img_keys, lower=1, upper=99,
                 b_min=0.0, b_max=1.0, clip=True,
             ),
-            CropForegroundd(keys=["image", "label"], source_key="image"),
+            CropForegroundd(keys=all_keys, source_key="image_post"),
+            ConcatItemsd(keys=img_keys, name="image", dim=0),
+            DeleteItemsd(keys=img_keys),
             SpatialPadd(keys=["image", "label"], spatial_size=PATCH_SIZE),
             EnsureTyped(keys=["image", "label"]),
         ])
 
-        data = transform({"image": image_path, "label": label_path})
+        data = transform({
+            "image_pre":  image_pre,
+            "image_post": image_post,
+            "label":      label_path,
+        })
 
         # float16 for image (normalized [0,1] — fine precision), uint8 for binary label
         image_arr = data["image"].numpy().astype(np.float16)
@@ -131,7 +141,7 @@ def main():
         print("Mode: VERIFY — existing files will be checked and corrupted ones reprocessed")
 
     tasks = [
-        (c["patient_id"], c["image"], c["label"],
+        (c["patient_id"], c["image_pre"], c["image_post"], c["label"],
          str(dst / f"{c['patient_id']}.npz"), args.verify)
         for c, dst in all_cases
     ]
