@@ -49,7 +49,7 @@ def parse_args():
     parser.add_argument("--model",       type=str, default="unet3d",
                         choices=["unet3d", "unet3d_fadc",
                                  "unet3d_fadc_encoder", "unet3d_fadc_bottleneck",
-                                 "unet3d_fadc_mid"],
+                                 "unet3d_fadc_mid", "unet3d_fadc_deep"],
                         help="Model architecture to train")
     parser.add_argument("--patch_size",  type=int, nargs=3, default=None,
                         metavar=("X", "Y", "Z"),
@@ -183,6 +183,8 @@ def train(cfg, args):
         model = UNet3DFADC(**model_kwargs, fadc_placement='bottleneck').to(device)
     elif args.model == "unet3d_fadc_mid":
         model = UNet3DFADC(**model_kwargs, fadc_placement='mid').to(device)
+    elif args.model == "unet3d_fadc_deep":
+        model = UNet3DFADC(**model_kwargs, fadc_placement='deep').to(device)
     else:
         model = UNet3D(**model_kwargs).to(device)
 

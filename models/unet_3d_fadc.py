@@ -96,6 +96,7 @@ class UNet3DFADC(nn.Module):
       'encoder'    — encoder only                    (FADC-Encoder ablation)
       'bottleneck' — bottleneck only                 (FADC-Bottleneck ablation)
       'mid'        — enc2 + enc3 only                (FADC-Mid — selective placement)
+      'deep'       — enc3 + enc4 + bottleneck        (FADC-Deep — deeper selective)
 
     Architecture depth and channel widths are identical across all placements —
     only the conv block type changes, making this a clean ablation.
@@ -103,11 +104,11 @@ class UNet3DFADC(nn.Module):
     def __init__(self, in_channels=1, out_channels=2, base_filters=32,
                  fadc_placement='full'):
         super().__init__()
-        assert fadc_placement in ('full', 'encoder', 'bottleneck', 'mid'), \
-            f"fadc_placement must be 'full', 'encoder', 'bottleneck', or 'mid', got '{fadc_placement}'"
+        assert fadc_placement in ('full', 'encoder', 'bottleneck', 'mid', 'deep'), \
+            f"fadc_placement must be 'full', 'encoder', 'bottleneck', 'mid', or 'deep', got '{fadc_placement}'"
 
         enc_fadc = fadc_placement in ('full', 'encoder')
-        bn_fadc  = fadc_placement in ('full', 'bottleneck')
+        bn_fadc  = fadc_placement in ('full', 'bottleneck', 'deep')
         dec_fadc = fadc_placement in ('full',)
 
         f = base_filters
@@ -117,6 +118,11 @@ class UNet3DFADC(nn.Module):
             self.enc2 = DownBlock(f,      f * 2,      use_fadc=True)
             self.enc3 = DownBlock(f * 2,  f * 4,      use_fadc=True)
             self.enc4 = DownBlock(f * 4,  f * 8,      use_fadc=False)
+        elif fadc_placement == 'deep':
+            self.enc1 = DownBlock(in_channels, f,     use_fadc=False)
+            self.enc2 = DownBlock(f,      f * 2,      use_fadc=False)
+            self.enc3 = DownBlock(f * 2,  f * 4,      use_fadc=True)
+            self.enc4 = DownBlock(f * 4,  f * 8,      use_fadc=True)
         else:
             self.enc1 = DownBlock(in_channels, f,     use_fadc=enc_fadc)
             self.enc2 = DownBlock(f,      f * 2,      use_fadc=enc_fadc)
@@ -149,11 +155,11 @@ class UNet3DFADC(nn.Module):
 
 
 if __name__ == '__main__':
-    for placement in ('full', 'encoder', 'bottleneck', 'mid'):
-        model = UNet3DFADC(in_channels=1, out_channels=2, base_filters=32,
+    for placement in ('full', 'encoder', 'bottleneck', 'mid', 'deep'):
+        model = UNet3DFADC(in_channels=2, out_channels=2, base_filters=32,
                            fadc_placement=placement)
         total = sum(p.numel() for p in model.parameters())
-        x = torch.randn(1, 1, 96, 96, 48)
+        x = torch.randn(1, 2, 96, 96, 48)
         with torch.no_grad():
             y = model(x)
         assert y.shape == (1, 2, 96, 96, 48)
