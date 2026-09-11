@@ -190,6 +190,24 @@ uses two optimizer steps, one whole-volume validation and a weight reload.
 It is an execution check, not evidence of segmentation accuracy or convergence.
 GPU out-of-memory errors stop the run; batch size is never silently reduced.
 
+Preflight displays per-case scan progress and optimizer-step progress. Training
+and final evaluation pass `--preflight-report` to reuse successful checks:
+the root, configuration, patient inventory, file sizes and modification times
+must match. These metadata checks avoid decompressing all volumes again; they
+are not cryptographic content checks. Old reports without file metadata require
+one new preflight. Training displays epoch/total, batch progress, live/mean loss
+and best Dice, and announces each new best checkpoint. A failed new preflight
+invalidates the previous success report.
+
+AMP gradient overflow now skips the unsafe optimizer update and lets GradScaler
+lower its scale before the next batch. Nonfinite unscaled gradients without a
+scaler, nonfinite loss, and eight consecutive overflows still stop execution.
+Affected parameter names and scale changes are printed; cumulative skipped
+updates and the current scale are logged. This handles transient overflow but
+does not establish the source of persistent numerical instability. The model,
+loss and optimizer configuration are unchanged; existing last.pt checkpoints
+remain loadable. Resume restarts the incomplete epoch, not the interrupted batch.
+
 Local suite after integration: 40 passed, two CUDA checks skipped (42 total).
 Local integration uses small synthetic volumes, not real patient data. Full-
 size CUDA memory, AMP, and real-data behavior remain for Kaggle verification.

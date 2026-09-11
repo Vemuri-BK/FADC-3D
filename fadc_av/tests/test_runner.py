@@ -40,11 +40,16 @@ class RunnerTests(unittest.TestCase):
                         '--output', str(output), '--mode', mode, '--allow-cpu']
                 if resume:
                     argv += ['--resume', str(resume)]
+                if mode != 'preflight':
+                    argv += ['--preflight-report', str(root / 'uninterrupted' / 'preflight.json')]
                 with patch('sys.argv', argv), patch('torch.cuda.is_available', return_value=False), contextlib.redirect_stdout(io.StringIO()):
                     run.main()
             output = root / 'uninterrupted'
             launch('preflight', output)
             self.assertTrue(json.loads((output / 'preflight.json').read_text())['passed'])
+            with patch.object(run.np, 'load', side_effect=AssertionError('Metadata path must not decompress volumes')):
+                _, _, fingerprint = run.inventory(root, cfg, check_arrays=False)
+            self.assertEqual(fingerprint, json.loads((output / 'preflight.json').read_text())['split_fingerprint'])
             with patch.object(run, 'atomic_save', side_effect=save_with_epoch_one):
                 launch('train', output)
             resumed = root / 'resumed'
@@ -56,6 +61,12 @@ class RunnerTests(unittest.TestCase):
                     torch.testing.assert_close(value, continued['model'][name], rtol=0, atol=0)
             launch('evaluate', resumed, resumed / 'best.pt' if (resumed / 'best.pt').exists() else output / 'best.pt')
             self.assertTrue((resumed / 'evaluation.json').is_file())
+            report_path = output / 'preflight.json'
+            report = json.loads(report_path.read_text())
+            report['file_stats']['train/train_0'][1] -= 1
+            report_path.write_text(json.dumps(report))
+            with self.assertRaisesRegex(ValueError, 'files changed'):
+                launch('train', root / 'stale')
             # An overlapping filename must be rejected even with correct counts.
             (root / 'val' / 'val_0.npz').rename(root / 'val' / 'train_0.npz')
             with self.assertRaisesRegex(ValueError, 'overlap'):

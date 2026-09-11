@@ -12,6 +12,7 @@ from pathlib import Path
 import random
 import shutil
 import subprocess
+import sys
 import time
 
 import numpy as np
@@ -27,7 +28,7 @@ from training.losses import DiceCELoss
 from .model import build_model
 
 
-def inventory(root, config):
+def inventory(root, config, *, check_arrays=True):
     """Fail closed on wrong split counts, duplicate patients or malformed cache."""
     root = Path(root)
     cases, manifest = {}, []
@@ -36,15 +37,16 @@ def inventory(root, config):
         if len(files) != config["expected_" + split] or not files:
             raise ValueError(f"{split}: found {len(files)}, expected {config['expected_' + split]}")
         cases[split] = []
-        for path in files:
-            with np.load(path, allow_pickle=False) as data:
-                x, y = data["image"], data["label"]
-                if x.ndim != 4 or x.shape[0] != 2 or y.shape != (1, *x.shape[1:]):
-                    raise ValueError(f"Invalid two-channel 3D image/mask shape: {path}")
-                if not np.isfinite(x).all() or not np.isfinite(y).all() or not np.isin(y, [0, 1]).all():
-                    raise ValueError(f"Nonfinite image or nonbinary mask: {path}")
-                if split == "train" and any(a < b for a, b in zip(x.shape[1:], config["patch_size"])):
-                    raise ValueError(f"Volume smaller than training patch: {path}")
+        for path in tqdm(files, desc=f"{split}: validate volumes" if check_arrays else f"{split}: check file metadata", unit="case", file=sys.stdout):
+            if check_arrays:
+                with np.load(path, allow_pickle=False) as data:
+                    x, y = data["image"], data["label"]
+                    if x.ndim != 4 or x.shape[0] != 2 or y.shape != (1, *x.shape[1:]):
+                        raise ValueError(f"Invalid two-channel 3D image/mask shape: {path}")
+                    if not np.isfinite(x).all() or not np.isfinite(y).all() or not np.isin(y, [0, 1]).all():
+                        raise ValueError(f"Nonfinite image or nonbinary mask: {path}")
+                    if split == "train" and any(a < b for a, b in zip(x.shape[1:], config["patch_size"])):
+                        raise ValueError(f"Volume smaller than training patch: {path}")
             cases[split].append({"patient_id": path.stem, "npz_path": str(path.resolve())})
             manifest.append({"split": split, "patient_id": path.stem,
                              "relative_path": f"{split}/{path.name}", "bytes": path.stat().st_size})
@@ -54,6 +56,16 @@ def inventory(root, config):
         raise ValueError("Patient IDs overlap between train and validation")
     digest = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
     return cases, manifest, digest
+
+
+def file_stats(cases):
+    """Cheap freshness check for an unchanged, read-only Kaggle dataset mount.
+
+    Size/mtime checks are not cryptographic content verification.
+    """
+    return {f"{split}/{case['patient_id']}": [Path(case['npz_path']).stat().st_size,
+                                             Path(case['npz_path']).stat().st_mtime_ns]
+            for split, items in cases.items() for case in items}
 
 
 def loaders(root, cases, cfg, epoch):
@@ -88,9 +100,29 @@ def step(model, batch, optimizer, scaler, device):
         raise RuntimeError("Nonfinite loss")
     scaler.scale(loss).backward()
     scaler.unscale_(optimizer)
+    named_grads = [(n, p.grad) for n, p in model.named_parameters() if p.grad is not None]
+    finite = torch.stack([torch.isfinite(g).all() for _, g in named_grads]).all()
+    if not finite:
+        bad = [n for n, g in named_grads if not torch.isfinite(g).all()]
+        if not scaler.is_enabled():
+            raise RuntimeError(f"Nonfinite gradients without AMP scaling: {bad[:8]}")
+        old_scale = scaler.get_scale()
+        # unscale_ recorded the overflow: step skips the unsafe optimizer update.
+        # Do not clip inf/NaN gradients, which would hide or propagate the fault.
+        scaler.step(optimizer)
+        scaler.update()
+        optimizer.zero_grad(set_to_none=True)
+        optimizer.amp_skips = getattr(optimizer, "amp_skips", 0) + 1
+        optimizer.consecutive_amp_skips = getattr(optimizer, "consecutive_amp_skips", 0) + 1
+        print(f"AMP update skipped: scale {old_scale:g} -> {scaler.get_scale():g}; "
+              f"nonfinite gradients in {bad[:8]}", flush=True)
+        if optimizer.consecutive_amp_skips >= 8:
+            raise RuntimeError("Eight consecutive AMP overflows; stop for numerical diagnosis")
+        return float(loss.detach())
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
     scaler.step(optimizer)
     scaler.update()
+    optimizer.consecutive_amp_skips = 0
     return float(loss.detach())
 
 
@@ -98,7 +130,7 @@ def step(model, batch, optimizer, scaler, device):
 def evaluate(model, loader, cfg, device):
     model.eval()
     rows = []
-    for batch in tqdm(loader, desc="Full-volume validation"):
+    for batch in tqdm(loader, desc="Full-volume validation", file=sys.stdout, unit="case"):
         # Keep full volumes and assembled logits on CPU; only windows use GPU.
         with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
             logits = sliding_window_inference(
@@ -126,6 +158,7 @@ def main():
     p.add_argument("--output", required=True)
     p.add_argument("--mode", choices=("preflight", "train", "evaluate"), default="preflight")
     p.add_argument("--resume", help="Trusted checkpoint created by this runner")
+    p.add_argument("--preflight-report", help="Reuse a successful preflight without decompressing all volumes")
     p.add_argument("--allow-cpu", action="store_true", help="Local synthetic verification only")
     args = p.parse_args()
     cfg = json.loads(Path(args.config).read_text())
@@ -134,7 +167,26 @@ def main():
         raise RuntimeError("Enable a Kaggle GPU before running")
     set_determinism(seed=cfg["seed"])
     torch.set_num_threads(min(4, os.cpu_count() or 1))
-    cases, manifest, fingerprint = inventory(args.cache_root, cfg)
+    if args.mode == "preflight":
+        if args.preflight_report:
+            raise ValueError("Preflight must perform its own full checks")
+        Path(args.output).mkdir(parents=True, exist_ok=True)
+        (Path(args.output) / "preflight.json").write_text(json.dumps({"passed": False}))
+    print(f"Starting {args.mode} on {device}", flush=True)
+    if args.preflight_report:
+        report = json.loads(Path(args.preflight_report).read_text())
+        if report.get("passed") is not True or report.get("config") != cfg:
+            raise ValueError("Preflight missing success or configuration mismatch")
+        if report.get("cache_root") != str(Path(args.cache_root).resolve()):
+            raise ValueError("Preflight has no matching cache root; rerun preflight with this launcher")
+        cases, manifest, fingerprint = inventory(args.cache_root, cfg, check_arrays=False)
+        if (report.get("split_fingerprint") != fingerprint
+                or report.get("file_stats") != file_stats(cases)):
+            raise ValueError("Dataset files changed since preflight; rerun preflight")
+        print("Preflight reused: no volume decompression scan. Building model...", flush=True)
+    else:
+        cases, manifest, fingerprint = inventory(args.cache_root, cfg)
+    checked_stats = file_stats(cases)
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
     if args.mode == "train" and (out / "last.pt").exists() and not args.resume:
@@ -159,6 +211,7 @@ def main():
         optimizer.load_state_dict(ckpt["optimizer"])
         scheduler.load_state_dict(ckpt["scheduler"])
         scaler.load_state_dict(ckpt["scaler"])
+        optimizer.amp_skips = ckpt.get("amp_skips", 0)
         start, best, history = ckpt["epoch"], ckpt["best_dice"], ckpt["history"]
         random.setstate(ckpt["python_rng"])
         np.random.set_state(ckpt["numpy_rng"])
@@ -191,10 +244,11 @@ def main():
                                if cfg["variant"] == "fadc_enc3" else "legacy plain 3D U-Net")}
     (out / f"{args.mode}_provenance.json").write_text(json.dumps(provenance, indent=2))
     if args.mode == "preflight":
+        print("Preflight: loading first training batch...", flush=True)
         train, val = loaders(args.cache_root, cases, cfg, 0)
         model.train()
         batch = next(iter(train))
-        losses = [step(model, batch, optimizer, scaler, device) for _ in range(2)]
+        losses = [step(model, batch, optimizer, scaler, device) for _ in tqdm(range(2), desc="Preflight optimizer steps", file=sys.stdout)]
         # One actual whole-volume validation and nonidentity model reload.
         score, _ = evaluate(model, [next(iter(val))], cfg, device)
         model.eval()
@@ -208,6 +262,7 @@ def main():
         torch.testing.assert_close(before, after)
         report = {"passed": True, "losses": losses, "one_case_dice": score,
                   "config": cfg, "split_fingerprint": fingerprint,
+                  "cache_root": str(Path(args.cache_root).resolve()), "file_stats": checked_stats,
                   "peak_gpu_gb": torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else None}
         (out / "preflight.json").write_text(json.dumps(report, indent=2))
         print(json.dumps(report, indent=2))
@@ -216,9 +271,16 @@ def main():
         t0 = time.time()
         train, val = loaders(args.cache_root, cases, cfg, epoch)
         model.train()
-        losses = [step(model, batch, optimizer, scaler, device) for batch in tqdm(train, desc=f"Epoch {epoch+1}")]
+        print(f"Epoch {epoch+1}/{cfg['epochs']}: {len(train)} batches; loading data...", flush=True)
+        losses = []
+        with tqdm(train, desc=f"Epoch {epoch+1}/{cfg['epochs']}", file=sys.stdout, unit="batch") as progress:
+            for batch in progress:
+                losses.append(step(model, batch, optimizer, scaler, device))
+                progress.set_postfix(loss=f"{losses[-1]:.4f}", mean_loss=f"{np.mean(losses):.4f}",
+                                     best_dice=f"{best:.4f}" if best >= 0 else "not validated")
         scheduler.step()
-        row = {"epoch": epoch + 1, "loss": float(np.mean(losses)), "lr": scheduler.get_last_lr()[0]}
+        row = {"epoch": epoch + 1, "loss": float(np.mean(losses)), "lr": scheduler.get_last_lr()[0],
+               "amp_skips_total": getattr(optimizer, "amp_skips", 0), "amp_scale": scaler.get_scale()}
         improved = False
         if (epoch + 1) % cfg["val_every"] == 0 or epoch + 1 == cfg["epochs"]:
             score, metrics = evaluate(model, val, cfg, device)
@@ -231,12 +293,14 @@ def main():
         state = {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
                  "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(),
                  "epoch": epoch + 1, "best_dice": best, "history": history, "config": cfg,
+                 "amp_skips": getattr(optimizer, "amp_skips", 0),
                  "split_fingerprint": fingerprint, "python_rng": random.getstate(),
                  "numpy_rng": np.random.get_state(), "torch_rng": torch.get_rng_state(),
                  "cuda_rng": torch.cuda.get_rng_state_all() if device.type == "cuda" else []}
         atomic_save(state, out / "last.pt")
         if improved:
             atomic_save(state, out / "best.pt")
+            print(f"New best model saved: epoch {epoch+1}, validation Dice {best:.6f}", flush=True)
         (out / "train_log.json").write_text(json.dumps(history, indent=2))
         print(json.dumps(row), flush=True)
 

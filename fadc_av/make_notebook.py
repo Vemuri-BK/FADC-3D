@@ -61,9 +61,9 @@ print('Preflight passed; peak allocated GPU GB:', report['peak_gpu_gb'])
 """), cell("code", """# Full training starts only after this session's successful preflight.
 assert report['passed'] and report['config'] == json.loads(Path('fadc_av/experiment.json').read_text())
 resume_args = ['--resume', RESUME] if RESUME else []
-run(*common, '--mode', 'train', *resume_args, env=env)
+run(*common, '--mode', 'train', '--preflight-report', OUTPUT / 'preflight.json', *resume_args, env=env)
 """), cell("code", """# Re-evaluate the selected checkpoint through the same whole-volume evaluator.
-run(*common, '--mode', 'evaluate', '--resume', OUTPUT / 'best.pt', env=env)
+run(*common, '--mode', 'evaluate', '--preflight-report', OUTPUT / 'preflight.json', '--resume', OUTPUT / 'best.pt', env=env)
 from IPython.display import FileLink, display
 for name in ('best.pt', 'last.pt', 'train_log.json', 'evaluation.json', 'train_provenance.json', 'pip_freeze.txt'):
     display(FileLink(str(OUTPUT / name)))
