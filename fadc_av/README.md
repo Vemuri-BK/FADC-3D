@@ -1,5 +1,10 @@
 # FADC-AV
 
+New to FADC? Read the [complete beginner's guide to our 3D implementation](README_FROM_ZERO.md).
+It starts with voxels and convolution, explains every component and equation,
+and follows the data through frequency selection, AdaKern, dilation mixing,
+the U-Net and training. This README focuses on implementation status and operation.
+
 Development branch: `feature/fadc-AV`.
 
 This package builds the verified discrete 3D FADC adaptation step by step.
