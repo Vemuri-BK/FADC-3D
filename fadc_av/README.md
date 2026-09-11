@@ -154,7 +154,8 @@ choices `(1,2,3)` and AdaKern are explicitly enabled. Temperature is fixed at
 
 `experiment.json` specifies seed 42, width 32, patch 128x128x64, physical batch
 2, 100 epochs, AdamW 1e-4, weight decay 1e-5, five warmup epochs, and validation
-every 25 epochs. The unchanged batch Dice+CE definition uses float32 loss
+every 10 epochs on all 306 validation cases using full-volume sliding-window
+inference (epochs 10, 20, ..., 100). The unchanged batch Dice+CE definition uses float32 loss
 reductions. Validation uses argmax, overlap zero, constant blending and no TTA.
 GPU windows are processed one at a time and assembled on CPU. Empty-ground-
 truth cases are excluded from mean foreground Dice, matching MONAI's default;

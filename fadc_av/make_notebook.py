@@ -15,6 +15,7 @@ def cell(kind, source):
 cells = [cell("markdown", """# FADC-AV: first image-only 3D experiment
 Existing two-channel 3D U-Net; replace enc3's second convolution only.
 Four frequency components, dilations (1,2,3), AdaKern enabled, no deep supervision.
+Full-volume validation on all 306 validation cases every 10 epochs (10, 20, ..., 100).
 Attach the preprocessed two-channel MAMA-MIA cache and enable a GPU + Internet.
 Set EXPECTED_COMMIT to the full commit containing these files after publishing the branch.
 Run cells in order. A failed check stops execution; do not silently reduce batch size.
