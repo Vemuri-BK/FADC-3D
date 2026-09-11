@@ -208,6 +208,16 @@ does not establish the source of persistent numerical instability. The model,
 loss and optimizer configuration are unchanged; existing last.pt checkpoints
 remain loadable. Resume restarts the incomplete epoch, not the interrupted batch.
 
+Each epoch writes `train_log.json` and `train_log.csv` for later charts, including
+training/validation/combined time in minutes (excluding checkpoint writes), loss,
+Dice-loss and CE-loss components, learning rate used and next learning rate,
+AMP skips, and pooled training-patch Dice/IoU/sensitivity/precision. Training
+metrics use argmax predictions before updates on augmented sampled patches,
+including batches whose AMP update was skipped; they are not full-volume scores.
+Validation Dice/IoU/sensitivity are per-case means recorded only on scheduled
+validation epochs; missing values remain null/blank. Older resumed epochs keep
+their original fields: new metrics cannot be reconstructed retrospectively.
+
 Local suite after integration: 40 passed, two CUDA checks skipped (42 total).
 Local integration uses small synthetic volumes, not real patient data. Full-
 size CUDA memory, AMP, and real-data behavior remain for Kaggle verification.

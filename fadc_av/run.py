@@ -5,6 +5,7 @@ Epoch-local loader seeds allow deterministic epoch-boundary resume; exact
 cross-device/library reproducibility is not promised. No mid-epoch resume.
 """
 import argparse
+import csv
 import hashlib
 import json
 import os
@@ -89,15 +90,30 @@ def atomic_save(state, path):
     os.replace(temp, path)
 
 
-def step(model, batch, optimizer, scaler, device):
+def overlap_metrics(tp, fp, fn):
+    """Foreground metrics from pooled counts; undefined denominators return None."""
+    return {"dice": 2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else None,
+            "iou": tp / (tp + fp + fn) if tp + fp + fn else None,
+            "sensitivity": tp / (tp + fn) if tp + fn else None,
+            "precision": tp / (tp + fp) if tp + fp else None}
+
+
+def step(model, batch, optimizer, scaler, device, *, return_metrics=False):
     x, y = batch["image"].to(device), batch["label"].to(device)
     optimizer.zero_grad(set_to_none=True)
     with torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
         logits = model(x)
     # Reductions over large 3D volumes must run in float32.
-    loss = DiceCELoss()(logits.float(), y)[0]
+    loss, dice_loss, ce_loss = DiceCELoss()(logits.float(), y)
     if not torch.isfinite(loss):
         raise RuntimeError("Nonfinite loss")
+    result = float(loss.detach())
+    if return_metrics:
+        with torch.no_grad():
+            pred, target = logits.argmax(1).bool(), y[:, 0].bool()
+            result = {"loss": float(loss.detach()), "dice_loss": float(dice_loss.detach()),
+                      "ce_loss": float(ce_loss.detach()), "tp": int((pred & target).sum()),
+                      "fp": int((pred & ~target).sum()), "fn": int((~pred & target).sum())}
     scaler.scale(loss).backward()
     scaler.unscale_(optimizer)
     named_grads = [(n, p.grad) for n, p in model.named_parameters() if p.grad is not None]
@@ -118,12 +134,12 @@ def step(model, batch, optimizer, scaler, device):
               f"nonfinite gradients in {bad[:8]}", flush=True)
         if optimizer.consecutive_amp_skips >= 8:
             raise RuntimeError("Eight consecutive AMP overflows; stop for numerical diagnosis")
-        return float(loss.detach())
+        return result
     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0, error_if_nonfinite=True)
     scaler.step(optimizer)
     scaler.update()
     optimizer.consecutive_amp_skips = 0
-    return float(loss.detach())
+    return result
 
 
 @torch.no_grad()
@@ -269,26 +285,44 @@ def main():
         return
     for epoch in range(start, cfg["epochs"]):
         t0 = time.time()
+        lr_used = optimizer.param_groups[0]["lr"]
+        skips_before = getattr(optimizer, "amp_skips", 0)
         train, val = loaders(args.cache_root, cases, cfg, epoch)
         model.train()
         print(f"Epoch {epoch+1}/{cfg['epochs']}: {len(train)} batches; loading data...", flush=True)
         losses = []
+        batch_metrics = []
         with tqdm(train, desc=f"Epoch {epoch+1}/{cfg['epochs']}", file=sys.stdout, unit="batch") as progress:
             for batch in progress:
-                losses.append(step(model, batch, optimizer, scaler, device))
+                batch_metrics.append(step(model, batch, optimizer, scaler, device, return_metrics=True))
+                losses.append(batch_metrics[-1]["loss"])
                 progress.set_postfix(loss=f"{losses[-1]:.4f}", mean_loss=f"{np.mean(losses):.4f}",
                                      best_dice=f"{best:.4f}" if best >= 0 else "not validated")
+        training_minutes = (time.time() - t0) / 60
         scheduler.step()
         row = {"epoch": epoch + 1, "loss": float(np.mean(losses)), "lr": scheduler.get_last_lr()[0],
                "amp_skips_total": getattr(optimizer, "amp_skips", 0), "amp_scale": scaler.get_scale()}
+        row.update({"training_minutes": training_minutes, "validation_minutes": 0.0,
+                    "lr_used": lr_used, "amp_skips_epoch": getattr(optimizer, "amp_skips", 0) - skips_before,
+                    "train_dice_loss": float(np.mean([m["dice_loss"] for m in batch_metrics])),
+                    "train_ce_loss": float(np.mean([m["ce_loss"] for m in batch_metrics])),
+                    "val_dice": None, "val_iou": None, "val_sensitivity": None})
+        counts = [sum(m[k] for m in batch_metrics) for k in ("tp", "fp", "fn")]
+        row.update({f"train_patch_{k}": v for k, v in overlap_metrics(*counts).items()})
         improved = False
         if (epoch + 1) % cfg["val_every"] == 0 or epoch + 1 == cfg["epochs"]:
+            val_start = time.time()
             score, metrics = evaluate(model, val, cfg, device)
             row["val_dice"] = score
+            row["val_iou"] = float(np.mean([m["iou"] for m in metrics]))
+            row["val_sensitivity"] = float(np.mean([m["sensitivity"] for m in metrics]))
+            row["validation_minutes"] = (time.time() - val_start) / 60
             improved = score > best
             best = max(best, score)
             (out / f"validation_{epoch+1:03d}.json").write_text(json.dumps(metrics, indent=2))
         row["seconds"] = time.time() - t0
+        row["epoch_minutes"] = row["seconds"] / 60
+        row["best_val_dice"] = best if best >= 0 else None
         history.append(row)
         state = {"model": model.state_dict(), "optimizer": optimizer.state_dict(),
                  "scheduler": scheduler.state_dict(), "scaler": scaler.state_dict(),
@@ -302,6 +336,14 @@ def main():
             atomic_save(state, out / "best.pt")
             print(f"New best model saved: epoch {epoch+1}, validation Dice {best:.6f}", flush=True)
         (out / "train_log.json").write_text(json.dumps(history, indent=2))
+        with (out / "train_log.csv").open("w", newline="") as handle:
+            fields = list(dict.fromkeys(k for entry in history for k in entry))
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(history)
+        print(f"Epoch {epoch+1}/{cfg['epochs']} | training {training_minutes:.2f} min | "
+              f"validation {row['validation_minutes']:.2f} min | loss {row['loss']:.4f} | "
+              f"training-patch Dice {row['train_patch_dice']} | validation Dice {row['val_dice']}", flush=True)
         print(json.dumps(row), flush=True)
 
 

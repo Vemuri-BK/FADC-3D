@@ -14,6 +14,14 @@ from fadc_av import run
 
 
 class RunnerTests(unittest.TestCase):
+    def test_pooled_overlap_metrics(self):
+        values = run.overlap_metrics(3, 1, 2)
+        self.assertAlmostEqual(values['dice'], 6 / 9)
+        self.assertEqual(values['iou'], 0.5)
+        self.assertEqual(values['sensitivity'], 0.6)
+        self.assertEqual(values['precision'], 0.75)
+        self.assertTrue(all(v is None for v in run.overlap_metrics(0, 0, 0).values()))
+
     def test_train_resume_evaluate_and_split_checks(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -55,6 +63,9 @@ class RunnerTests(unittest.TestCase):
             resumed = root / 'resumed'
             launch('train', resumed, root / 'epoch_one.pt')
             full = torch.load(output / 'last.pt', weights_only=False)
+            self.assertTrue((output / 'train_log.csv').is_file())
+            self.assertGreater(full['history'][0]['training_minutes'], 0)
+            self.assertIn('train_patch_dice', full['history'][0])
             continued = torch.load(resumed / 'last.pt', weights_only=False)
             for name, value in full['model'].items():
                 if isinstance(value, torch.Tensor):

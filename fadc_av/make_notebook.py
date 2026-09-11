@@ -65,7 +65,7 @@ run(*common, '--mode', 'train', '--preflight-report', OUTPUT / 'preflight.json',
 """), cell("code", """# Re-evaluate the selected checkpoint through the same whole-volume evaluator.
 run(*common, '--mode', 'evaluate', '--preflight-report', OUTPUT / 'preflight.json', '--resume', OUTPUT / 'best.pt', env=env)
 from IPython.display import FileLink, display
-for name in ('best.pt', 'last.pt', 'train_log.json', 'evaluation.json', 'train_provenance.json', 'pip_freeze.txt'):
+for name in ('best.pt', 'last.pt', 'train_log.json', 'train_log.csv', 'evaluation.json', 'train_provenance.json', 'pip_freeze.txt'):
     display(FileLink(str(OUTPUT / name)))
 print('Save a Kaggle notebook version with outputs to retain artifacts after the session ends.')
 """)]
