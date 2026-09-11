@@ -40,7 +40,7 @@ class RunnerTests(unittest.TestCase):
             original_save = run.atomic_save
             def save_with_epoch_one(state, path):
                 original_save(state, path)
-                if path.name == 'last.pt' and state['epoch'] == 1:
+                if path.name == 'last.pth' and state['epoch'] == 1:
                     original_save(state, root / 'epoch_one.pt')
                     original_save(state, root / 'best.pt')
             def launch(mode, output, resume=None):
@@ -62,15 +62,15 @@ class RunnerTests(unittest.TestCase):
                 launch('train', output)
             resumed = root / 'resumed'
             launch('train', resumed, root / 'epoch_one.pt')
-            full = torch.load(output / 'last.pt', weights_only=False)
+            full = torch.load(output / 'last.pth', weights_only=False)
             self.assertTrue((output / 'train_log.csv').is_file())
             self.assertGreater(full['history'][0]['training_minutes'], 0)
             self.assertIn('train_patch_dice', full['history'][0])
-            continued = torch.load(resumed / 'last.pt', weights_only=False)
+            continued = torch.load(resumed / 'last.pth', weights_only=False)
             for name, value in full['model'].items():
                 if isinstance(value, torch.Tensor):
                     torch.testing.assert_close(value, continued['model'][name], rtol=0, atol=0)
-            launch('evaluate', resumed, resumed / 'best.pt' if (resumed / 'best.pt').exists() else output / 'best.pt')
+            launch('evaluate', resumed, resumed / 'best.pth' if (resumed / 'best.pth').exists() else output / 'best.pth')
             self.assertTrue((resumed / 'evaluation.json').is_file())
             report_path = output / 'preflight.json'
             report = json.loads(report_path.read_text())

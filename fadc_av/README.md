@@ -171,7 +171,7 @@ Augmentations reuse the existing cached dataset transforms, with MONAI worker
 seeding and per-epoch loader seeds. Checkpoints save optimizer, scheduler,
 scaler, RNG state, runtime attention temperature and configuration. Resume is
 at epoch boundaries; an interrupted partial epoch is repeated. Preserve both
-`last.pt` and `best.pt` together when moving to a new Kaggle session. Exact
+`last.pth` and `best.pth` together when moving to a new Kaggle session. Exact
 cross-GPU/library reproducibility is not guaranteed. Synthetic CPU testing
 compares resumed and uninterrupted model tensors exactly.
 
@@ -205,7 +205,7 @@ scaler, nonfinite loss, and eight consecutive overflows still stop execution.
 Affected parameter names and scale changes are printed; cumulative skipped
 updates and the current scale are logged. This handles transient overflow but
 does not establish the source of persistent numerical instability. The model,
-loss and optimizer configuration are unchanged; existing last.pt checkpoints
+loss and optimizer configuration are unchanged; existing last.pth checkpoints
 remain loadable. Resume restarts the incomplete epoch, not the interrupted batch.
 
 Each epoch writes `train_log.json` and `train_log.csv` for later charts, including
@@ -229,6 +229,11 @@ Pretraining and metadata/language conditioning remain separate experiments.
 The new operator does not import legacy FADC code.
 
 ## All-encoder placement experiment
+
+New checkpoints use `.pth`: `last.pth`, `best.pth` and `preflight_model.pth`.
+Explicit `--resume` paths still accept older `.pt` files. Resume also locates
+an older sibling `best.pt` when needed and preserves it as `best.pth`.
+Do not rename files while an older running process is still writing them.
 
 `experiment_all_encoders.json` changes only `variant` to `fadc_all_encoders`.
 Both convolutions in enc1 through enc4 use full FADC (eight adaptive operators).

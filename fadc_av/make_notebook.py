@@ -29,7 +29,7 @@ EXPECTED_COMMIT = ''  # Required: full 40-character SHA containing fadc_av
 CACHE_ROOT = Path('/kaggle/input/datasets/bharathvemurik/mama-mia-preprocessed-cache-2ch')
 REPO = Path('/kaggle/working/FADC-AV')
 OUTPUT = Path('/kaggle/working/outputs/fadc_av_enc3_full_s42')
-RESUME = ''  # Optional trusted last.pt from a previous Kaggle session
+RESUME = ''  # Optional trusted last.pth from a previous Kaggle session
 assert re.fullmatch(r'[0-9a-fA-F]{40}', EXPECTED_COMMIT), 'Set the published full commit SHA first'
 assert (CACHE_ROOT / 'train').is_dir() and (CACHE_ROOT / 'val').is_dir(), 'Correct CACHE_ROOT to contain train/ and val/'
 def run(*args, **kwargs):
@@ -63,9 +63,9 @@ assert report['passed'] and report['config'] == json.loads(Path('fadc_av/experim
 resume_args = ['--resume', RESUME] if RESUME else []
 run(*common, '--mode', 'train', '--preflight-report', OUTPUT / 'preflight.json', *resume_args, env=env)
 """), cell("code", """# Re-evaluate the selected checkpoint through the same whole-volume evaluator.
-run(*common, '--mode', 'evaluate', '--preflight-report', OUTPUT / 'preflight.json', '--resume', OUTPUT / 'best.pt', env=env)
+run(*common, '--mode', 'evaluate', '--preflight-report', OUTPUT / 'preflight.json', '--resume', OUTPUT / 'best.pth', env=env)
 from IPython.display import FileLink, display
-for name in ('best.pt', 'last.pt', 'train_log.json', 'train_log.csv', 'evaluation.json', 'train_provenance.json', 'pip_freeze.txt'):
+for name in ('best.pth', 'last.pth', 'train_log.json', 'train_log.csv', 'evaluation.json', 'train_provenance.json', 'pip_freeze.txt'):
     display(FileLink(str(OUTPUT / name)))
 print('Save a Kaggle notebook version with outputs to retain artifacts after the session ends.')
 """)]

@@ -205,7 +205,7 @@ def main():
     checked_stats = file_stats(cases)
     out = Path(args.output)
     out.mkdir(parents=True, exist_ok=True)
-    if args.mode == "train" and (out / "last.pt").exists() and not args.resume:
+    if args.mode == "train" and any((out / name).exists() for name in ("last.pth", "last.pt")) and not args.resume:
         raise ValueError("Output already contains a run; use --resume or a fresh directory")
     model = build_model(cfg).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
@@ -235,18 +235,20 @@ def main():
         if device.type == "cuda":
             torch.cuda.set_rng_state_all(ckpt["cuda_rng"])
         # Preserve the previously selected model when resuming into a new session.
-        if args.mode == "train" and best >= 0 and not (out / "best.pt").exists():
-            previous_best = Path(args.resume).parent / "best.pt"
+        if args.mode == "train" and best >= 0 and not (out / "best.pth").exists():
+            previous_best = Path(args.resume).parent / "best.pth"
             if not previous_best.is_file():
-                raise ValueError("Resume requires the previous best.pt alongside last.pt")
+                previous_best = Path(args.resume).parent / "best.pt"
+            if not previous_best.is_file():
+                raise ValueError("Resume requires the previous best.pth alongside last.pth")
             saved_best = torch.load(previous_best, map_location="cpu", weights_only=False)
             if (saved_best["config"] != cfg or saved_best["split_fingerprint"] != fingerprint
                     or saved_best["best_dice"] != best or saved_best["epoch"] > start):
-                raise ValueError("Previous best.pt does not match the resumed run")
-            shutil.copy2(previous_best, out / "best.pt")
+                raise ValueError("Previous best.pth does not match the resumed run")
+            shutil.copy2(previous_best, out / "best.pth")
     if args.mode == "evaluate":
         if not args.resume:
-            raise ValueError("Evaluation requires --resume pointing to best.pt")
+            raise ValueError("Evaluation requires --resume pointing to best.pth")
         _, val = loaders(args.cache_root, cases, cfg, start)
         score, rows = evaluate(model, val, cfg, device)
         (out / "evaluation.json").write_text(json.dumps({"mean_dice": score, "cases": rows}, indent=2))
@@ -271,8 +273,8 @@ def main():
         x = batch["image"][:1].to(device)
         with torch.no_grad(), torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
             before = model(x).float().cpu()
-        atomic_save({"model": model.state_dict()}, out / "preflight_model.pt")
-        model.load_state_dict(torch.load(out / "preflight_model.pt", map_location=device, weights_only=False)["model"])
+        atomic_save({"model": model.state_dict()}, out / "preflight_model.pth")
+        model.load_state_dict(torch.load(out / "preflight_model.pth", map_location=device, weights_only=False)["model"])
         with torch.no_grad(), torch.autocast(device_type=device.type, enabled=device.type == "cuda"):
             after = model(x).float().cpu()
         torch.testing.assert_close(before, after)
@@ -331,9 +333,9 @@ def main():
                  "split_fingerprint": fingerprint, "python_rng": random.getstate(),
                  "numpy_rng": np.random.get_state(), "torch_rng": torch.get_rng_state(),
                  "cuda_rng": torch.cuda.get_rng_state_all() if device.type == "cuda" else []}
-        atomic_save(state, out / "last.pt")
+        atomic_save(state, out / "last.pth")
         if improved:
-            atomic_save(state, out / "best.pt")
+            atomic_save(state, out / "best.pth")
             print(f"New best model saved: epoch {epoch+1}, validation Dice {best:.6f}", flush=True)
         (out / "train_log.json").write_text(json.dumps(history, indent=2))
         with (out / "train_log.csv").open("w", newline="") as handle:
