@@ -256,8 +256,8 @@ def main():
                   "torch": torch.__version__, "device": str(device),
                   "git_commit": subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
                   "git_status": subprocess.check_output(["git", "status", "--porcelain"], text=True),
-                  "operator": ("enc3 second conv; four bands; d=1,2,3; AdaKern; fixed temperature=1"
-                               if cfg["variant"] == "fadc_enc3" else "legacy plain 3D U-Net")}
+                  "operator": ("legacy plain 3D U-Net" if cfg["variant"] == "baseline" else
+                               f"{cfg['variant']}; four bands; d=1,2,3; AdaKern; fixed temperature=1")}
     (out / f"{args.mode}_provenance.json").write_text(json.dumps(provenance, indent=2))
     if args.mode == "preflight":
         print("Preflight: loading first training batch...", flush=True)

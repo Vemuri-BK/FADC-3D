@@ -6,6 +6,27 @@ from models.unet_3d import UNet3D
 
 
 class ModelTests(unittest.TestCase):
+    def test_all_encoders_placement_backward_and_reload(self):
+        torch.set_num_threads(2)
+        cfg = {"variant": "fadc_all_encoders", "base_filters": 2}
+        model = build_model(cfg)
+        names = [n for n, m in model.named_modules() if isinstance(m, AdaptiveDilatedConv3D)]
+        self.assertEqual(names, [f"enc{i}.conv.block.{j}" for i in range(1, 5) for j in (0, 3)])
+        x = torch.randn(2, 2, 32, 32, 16)
+        y = model(x)
+        self.assertEqual(y.shape, x.shape)
+        y.square().mean().backward()
+        for name, module in model.named_modules():
+            if isinstance(module, AdaptiveDilatedConv3D):
+                grads = [p.grad for p in module.parameters() if p.grad is not None]
+                self.assertTrue(grads, name)
+                self.assertTrue(all(torch.isfinite(g).all() for g in grads), name)
+        model.eval()
+        restored = build_model(cfg).eval()
+        restored.load_state_dict(model.state_dict())
+        with torch.no_grad():
+            torch.testing.assert_close(model(x), restored(x))
+
     def test_only_enc3_second_convolution_replaced(self):
         model = FADCAVUNet3D(base_filters=2)
         base = UNet3D(in_channels=2, base_filters=2)

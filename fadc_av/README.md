@@ -227,3 +227,22 @@ with outputs to retain them. No GPU training has been launched locally.
 
 Pretraining and metadata/language conditioning remain separate experiments.
 The new operator does not import legacy FADC code.
+
+## All-encoder placement experiment
+
+`experiment_all_encoders.json` changes only `variant` to `fadc_all_encoders`.
+Both convolutions in enc1 through enc4 use full FADC (eight adaptive operators).
+Bottleneck and decoder remain plain; no residual connections or dropout are
+introduced. Four bands, dilations 1/2/3, AdaKern, seed 42, width 32, batch 2,
+100 epochs and validation every 10 epochs on all 306 cases match the enc3 run.
+
+Generate the separate launcher with `python -m fadc_av.make_notebook
+--variant all_encoders --commit FULL_SHA` (on one command line). The artifact is
+`kaggle_fadc_av_all_encoders_full_s42.ipynb`, with output directory
+`/kaggle/working/outputs/fadc_av_all_encoders_full_s42`. On another Kaggle account,
+attach the same cache dataset version and update CACHE_ROOT for that account.
+Start from scratch: an enc3 checkpoint cannot resume this architecture.
+Production GPU memory/throughput must pass preflight; eight adaptive operators
+can be substantially more expensive. Do not reduce batch or width silently,
+because doing so changes the placement comparison. Local tests check all eight
+locations, volumetric output shape, finite gradients and checkpoint reload.

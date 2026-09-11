@@ -71,7 +71,20 @@ print('Save a Kaggle notebook version with outputs to retain artifacts after the
 """)]
 parser = argparse.ArgumentParser(__doc__)
 parser.add_argument('--commit', default='', help='Published full SHA containing the experiment code')
+parser.add_argument('--variant', choices=('enc3', 'all_encoders'), default='enc3')
 args = parser.parse_args()
+if args.variant == 'all_encoders':
+    replacements = {
+        'first image-only 3D experiment': 'all-encoder image-only 3D experiment',
+        "replace enc3's second convolution only.": 'replace both convolutions in enc1, enc2, enc3 and enc4 (eight FADC convolutions).',
+        'fadc_av/experiment.json': 'fadc_av/experiment_all_encoders.json',
+        'fadc_av_enc3_full_s42': 'fadc_av_all_encoders_full_s42',
+    }
+    for item in cells:
+        source = ''.join(item['source'])
+        for old, new in replacements.items():
+            source = source.replace(old, new)
+        item['source'] = source.splitlines(keepends=True)
 if args.commit:
     if not re.fullmatch(r'[0-9a-fA-F]{40}', args.commit):
         parser.error('--commit must be a full 40-character Git SHA')
@@ -80,4 +93,5 @@ if args.commit:
                           for line in item['source']]
 notebook = {"cells": cells, "metadata": {"kernelspec": {"display_name": "Python 3", "language": "python", "name": "python3"},
                                       "language_info": {"name": "python"}}, "nbformat": 4, "nbformat_minor": 4}
-Path('kaggle_fadc_av_enc3_full_s42.ipynb').write_text(json.dumps(notebook, indent=2) + '\n', encoding='utf-8')
+name = 'all_encoders' if args.variant == 'all_encoders' else 'enc3'
+Path(f'kaggle_fadc_av_{name}_full_s42.ipynb').write_text(json.dumps(notebook, indent=2) + '\n', encoding='utf-8')
