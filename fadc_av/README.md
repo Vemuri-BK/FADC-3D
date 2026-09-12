@@ -2,6 +2,35 @@
 
 Development branch: `feature/fadc-AV`.
 
+## Restarting Kaggle sessions
+
+Use the updated notebook cells together. Setup writes a variant-specific
+`/kaggle/working/fadc_av_*_session.json` containing absolute checkout, config,
+dataset and output paths. Every later cell reloads it; old Python variables
+such as `report`, `common` and `env` are not required after a kernel restart.
+Run setup and the environment/test cell after restarting, then the training cell.
+
+`RESUME='auto'` finds `last.pth`, falling back to legacy `last.pt` in the output
+directory. An explicit path supports checkpoints attached from saved outputs.
+Both best and last checkpoints should be preserved together. Existing history
+without a last checkpoint stops instead of silently starting from epoch one.
+If Kaggle has removed the working directory, restore saved outputs first;
+displayed notebook logs do not contain model weights.
+
+Setup uses a checkout named for the pinned commit. If it is dirty or unsuitable,
+it creates a new folder and preserves the old one. It never resets user edits.
+Both variants have separate session-settings files and output directories.
+
+On resume, no optimizer preflight is rerun. The launcher reads data-check state
+from disk. New reports include NPZ archive-directory CRC and size signatures,
+so modification-time changes alone do not trigger a full rescan. This compares
+archive headers, not cryptographic content hashes; retain the same dataset version.
+Missing/legacy/stale reports automatically trigger one full array validation,
+with progress, and then continue training. Array checks are recorded separately
+from a successful GPU preflight. Configuration and checkpoint split mismatches
+still fail rather than silently switching experiments. Model, optimizer, loss,
+AMP recovery and validation cadence are unchanged by these restart fixes.
+
 This package builds the verified discrete 3D FADC adaptation step by step.
 Python implementation and tests live in Git; Kaggle will check out a pinned
 commit and execute GPU verification and training scripts.
@@ -191,11 +220,10 @@ It is an execution check, not evidence of segmentation accuracy or convergence.
 GPU out-of-memory errors stop the run; batch size is never silently reduced.
 
 Preflight displays per-case scan progress and optimizer-step progress. Training
-and final evaluation pass `--preflight-report` to reuse successful checks:
-the root, configuration, patient inventory, file sizes and modification times
-must match. These metadata checks avoid decompressing all volumes again; they
-are not cryptographic content checks. Old reports without file metadata require
-one new preflight. Training displays epoch/total, batch progress, live/mean loss
+and final evaluation pass `--preflight-report --refresh-preflight` to reuse
+data checks using configuration, inventory and archive signatures. Older reports
+are automatically revalidated once when needed. See the restart instructions
+above for timestamp handling and checkpoint restoration. Training displays epoch/total, batch progress, live/mean loss
 and best Dice, and announces each new best checkpoint. A failed new preflight
 invalidates the previous success report.
 

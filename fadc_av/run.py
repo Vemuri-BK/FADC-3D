@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import sys
 import time
+import zipfile
 
 import numpy as np
 import torch
@@ -67,6 +68,58 @@ def file_stats(cases):
     return {f"{split}/{case['patient_id']}": [Path(case['npz_path']).stat().st_size,
                                              Path(case['npz_path']).stat().st_mtime_ns]
             for split, items in cases.items() for case in items}
+
+
+def archive_signatures(cases):
+    """NPZ directory CRC/size signatures, independent of mount timestamps.
+
+    Reads archive directories, not array payloads. This is not a cryptographic
+    guarantee; keep the dataset version fixed and use the full scan for new data.
+    """
+    result = {}
+    for split, items in cases.items():
+        for case in tqdm(items, desc=f"{split}: archive signatures", file=sys.stdout, unit="case"):
+            with zipfile.ZipFile(case['npz_path']) as archive:
+                result[f"{split}/{case['patient_id']}"] = sorted(
+                    [[i.filename, i.CRC, i.file_size, i.compress_size] for i in archive.infolist()])
+    return result
+
+
+def reusable_inventory(root, cfg, report_path, refresh=False):
+    path = Path(report_path)
+    try:
+        report = json.loads(path.read_text())
+    except (FileNotFoundError, json.JSONDecodeError):
+        report = {}
+    if report.get('config') is not None and report['config'] != cfg:
+        raise ValueError('Preflight configuration mismatch: check experiment/output folder')
+    cases, manifest, fingerprint = inventory(root, cfg, check_arrays=False)
+    signatures = archive_signatures(cases) if refresh else None
+    valid = (report.get('passed') is True or report.get('data_checked') is True)
+    valid = valid and report.get('config') == cfg and report.get('split_fingerprint') == fingerprint
+    if refresh and report.get('archive_signatures') is not None:
+        valid = valid and report['archive_signatures'] == signatures
+    else:
+        valid = (valid and report.get('cache_root') == str(Path(root).resolve())
+                 and report.get('file_stats') == file_stats(cases))
+    if not valid:
+        if not refresh:
+            raise ValueError('Dataset files changed or preflight missing success; rerun preflight')
+        print('Saved checks are missing or stale. Validating arrays once, then continuing automatically.', flush=True)
+        cases, manifest, fingerprint = inventory(root, cfg)
+    else:
+        print('Saved data checks reused: no volume decompression scan.', flush=True)
+    if refresh:
+        # Data validation does not claim to have rerun GPU preflight.
+        updated = {'passed': report.get('passed') is True and valid, 'data_checked': True,
+                   'config': cfg, 'split_fingerprint': fingerprint,
+                   'cache_root': str(Path(root).resolve()), 'file_stats': file_stats(cases),
+                   'archive_signatures': signatures}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_suffix('.json.tmp')
+        temp.write_text(json.dumps(updated, indent=2))
+        os.replace(temp, path)
+    return cases, manifest, fingerprint
 
 
 def loaders(root, cases, cfg, epoch):
@@ -175,6 +228,7 @@ def main():
     p.add_argument("--mode", choices=("preflight", "train", "evaluate"), default="preflight")
     p.add_argument("--resume", help="Trusted checkpoint created by this runner")
     p.add_argument("--preflight-report", help="Reuse a successful preflight without decompressing all volumes")
+    p.add_argument("--refresh-preflight", action="store_true", help="Automatically refresh stale data checks; no extra optimizer preflight")
     p.add_argument("--allow-cpu", action="store_true", help="Local synthetic verification only")
     args = p.parse_args()
     cfg = json.loads(Path(args.config).read_text())
@@ -190,16 +244,8 @@ def main():
         (Path(args.output) / "preflight.json").write_text(json.dumps({"passed": False}))
     print(f"Starting {args.mode} on {device}", flush=True)
     if args.preflight_report:
-        report = json.loads(Path(args.preflight_report).read_text())
-        if report.get("passed") is not True or report.get("config") != cfg:
-            raise ValueError("Preflight missing success or configuration mismatch")
-        if report.get("cache_root") != str(Path(args.cache_root).resolve()):
-            raise ValueError("Preflight has no matching cache root; rerun preflight with this launcher")
-        cases, manifest, fingerprint = inventory(args.cache_root, cfg, check_arrays=False)
-        if (report.get("split_fingerprint") != fingerprint
-                or report.get("file_stats") != file_stats(cases)):
-            raise ValueError("Dataset files changed since preflight; rerun preflight")
-        print("Preflight reused: no volume decompression scan. Building model...", flush=True)
+        cases, manifest, fingerprint = reusable_inventory(
+            args.cache_root, cfg, args.preflight_report, args.refresh_preflight)
     else:
         cases, manifest, fingerprint = inventory(args.cache_root, cfg)
     checked_stats = file_stats(cases)
@@ -229,6 +275,7 @@ def main():
         scaler.load_state_dict(ckpt["scaler"])
         optimizer.amp_skips = ckpt.get("amp_skips", 0)
         start, best, history = ckpt["epoch"], ckpt["best_dice"], ckpt["history"]
+        print(f"Loaded {args.resume}: completed epoch {start}; next epoch {start+1}; best Dice {best}", flush=True)
         random.setstate(ckpt["python_rng"])
         np.random.set_state(ckpt["numpy_rng"])
         torch.set_rng_state(ckpt["torch_rng"])
@@ -281,6 +328,7 @@ def main():
         report = {"passed": True, "losses": losses, "one_case_dice": score,
                   "config": cfg, "split_fingerprint": fingerprint,
                   "cache_root": str(Path(args.cache_root).resolve()), "file_stats": checked_stats,
+                  "archive_signatures": archive_signatures(cases),
                   "peak_gpu_gb": torch.cuda.max_memory_allocated() / 1e9 if device.type == "cuda" else None}
         (out / "preflight.json").write_text(json.dumps(report, indent=2))
         print(json.dumps(report, indent=2))

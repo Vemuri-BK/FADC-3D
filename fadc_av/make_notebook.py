@@ -12,62 +12,82 @@ def cell(kind, source):
     return value
 
 
-cells = [cell("markdown", """# FADC-AV: first image-only 3D experiment
+BOOTSTRAP = """from pathlib import Path
+import json, importlib.util
+STATE_FILE = Path('/kaggle/working/fadc_av_enc3_session.json')
+assert STATE_FILE.is_file(), 'Run the setup cell once to restore session settings.'
+state = json.loads(STATE_FILE.read_text())
+spec = importlib.util.spec_from_file_location('fadc_notebook_runtime', Path(state['repo']) / 'fadc_av/notebook_runtime.py')
+runtime = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(runtime)
+session = runtime.NotebookSession(state)
+"""
+
+cells = [cell('markdown', """# FADC-AV: first image-only 3D experiment
 Existing two-channel 3D U-Net; replace enc3's second convolution only.
-Four frequency components, dilations (1,2,3), AdaKern enabled, no deep supervision.
-Full-volume validation on all 306 validation cases every 10 epochs (10, 20, ..., 100).
-Attach the preprocessed two-channel MAMA-MIA cache and enable a GPU + Internet.
-Set EXPECTED_COMMIT to the full commit containing these files after publishing the branch.
-Run cells in order. A failed check stops execution; do not silently reduce batch size.
-The historical baseline is a reference; corrected augmentation seeding means a new matched
-baseline is needed for a strict final comparison. Validation is model selection, not a held-out test.
-"""), cell("code", """from pathlib import Path
-import os, re, subprocess, sys, json
+Four bands, dilation (1,2,3), AdaKern; full validation on all 306 cases every 10 epochs.
+Enable GPU and Internet. Attach the SAME dataset version used previously.
+Setup saves settings on disk. Later cells reload them and do not depend on old Python variables.
+RESUME='auto' resumes last.pth (or legacy last.pt); an explicit path can restore an attached checkpoint.
+Keep both last.pth and best.pth when exporting checkpoints. If Kaggle did not preserve working files,
+attach saved outputs and set RESUME to last.pth. Checkpoints cannot be recovered from displayed logs.
+On restart: run setup and environment checks, then training. Model preflight is skipped when resuming.
+Changed timestamps alone do not invalidate new archive signatures. Older reports may need one automatic
+array validation scan, with progress; training then continues without manual cell changes.
+"""), cell('code', """from pathlib import Path
+import json, subprocess, tempfile
 REPO_URL = 'https://github.com/Vemuri-BK/FADC-3D.git'
 BRANCH = 'feature/fadc-AV'
-EXPECTED_COMMIT = ''  # Required: full 40-character SHA containing fadc_av
-CACHE_ROOT = Path('/kaggle/input/datasets/bharathvemurik/mama-mia-preprocessed-cache-2ch')
-REPO = Path('/kaggle/working/FADC-AV')
+EXPECTED_COMMIT = ''
+CACHE_ROOT = Path('/kaggle/input/datasets/vbk1999/mama-mia-preprocessed-cache-2ch')
 OUTPUT = Path('/kaggle/working/outputs/fadc_av_enc3_full_s42')
-RESUME = ''  # Optional trusted last.pth from a previous Kaggle session
-assert re.fullmatch(r'[0-9a-fA-F]{40}', EXPECTED_COMMIT), 'Set the published full commit SHA first'
-assert (CACHE_ROOT / 'train').is_dir() and (CACHE_ROOT / 'val').is_dir(), 'Correct CACHE_ROOT to contain train/ and val/'
-def run(*args, **kwargs):
-    subprocess.run([str(a) for a in args], check=True, **kwargs)
-if not REPO.exists():
-    run('git', 'clone', '--branch', BRANCH, REPO_URL, REPO)
-assert not subprocess.check_output(['git', '-C', str(REPO), 'status', '--porcelain'], text=True).strip(), 'Checkout has local changes'
-run('git', '-C', REPO, 'fetch', 'origin', BRANCH)
-run('git', '-C', REPO, 'checkout', '--detach', EXPECTED_COMMIT)
-assert subprocess.check_output(['git', '-C', str(REPO), 'rev-parse', 'HEAD'], text=True).strip() == EXPECTED_COMMIT.lower()
-os.chdir(REPO)
-assert (REPO / 'fadc_av/run.py').is_file()
-"""), cell("code", """# Keep Kaggle's CUDA-compatible PyTorch installation.
-run(sys.executable, '-m', 'pip', 'install', 'monai==1.5.2', 'nibabel', 'pandas', 'tqdm')
-import torch
-assert torch.cuda.is_available(), 'Enable GPU accelerator'
-print(torch.__version__, torch.cuda.get_device_name(0))
-OUTPUT.mkdir(parents=True, exist_ok=True)
-(OUTPUT / 'pip_freeze.txt').write_text(subprocess.check_output([sys.executable, '-m', 'pip', 'freeze'], text=True))
-env = dict(os.environ, PYTHONHASHSEED='42', CUDA_VISIBLE_DEVICES='0')
-run(sys.executable, '-B', '-m', 'unittest', 'discover', '-s', 'fadc_av/tests', '-v', env=env)
-"""), cell("code", """# Scan every cache file, check disjoint patient IDs, then test the production model/patch/batch.
-common = [sys.executable, '-u', '-m', 'fadc_av.run', '--config', 'fadc_av/experiment.json',
-          '--cache-root', str(CACHE_ROOT), '--output', str(OUTPUT)]
-run(*common, '--mode', 'preflight', env=env)
-report = json.loads((OUTPUT / 'preflight.json').read_text())
-assert report['passed']
-print('Preflight passed; peak allocated GPU GB:', report['peak_gpu_gb'])
-"""), cell("code", """# Full training starts only after this session's successful preflight.
-assert report['passed'] and report['config'] == json.loads(Path('fadc_av/experiment.json').read_text())
-resume_args = ['--resume', RESUME] if RESUME else []
-run(*common, '--mode', 'train', '--preflight-report', OUTPUT / 'preflight.json', *resume_args, env=env)
-"""), cell("code", """# Re-evaluate the selected checkpoint through the same whole-volume evaluator.
-run(*common, '--mode', 'evaluate', '--preflight-report', OUTPUT / 'preflight.json', '--resume', OUTPUT / 'best.pth', env=env)
+RESUME = 'auto'  # Or a trusted last.pth path from saved outputs; keep best.pth beside it.
+STATE_FILE = Path('/kaggle/working/fadc_av_enc3_session.json')
+CONFIG_RELATIVE = 'fadc_av/experiment.json'
+assert len(EXPECTED_COMMIT) == 40, 'Set the pinned commit SHA'
+assert (CACHE_ROOT / 'train').is_dir() and (CACHE_ROOT / 'val').is_dir(), 'Correct CACHE_ROOT'
+def git(*args):
+    return subprocess.check_output(['git', *map(str, args)], text=True).strip()
+def usable(path):
+    try:
+        return (git('-C', path, 'remote', 'get-url', 'origin') == REPO_URL
+                and git('-C', path, 'rev-parse', 'HEAD') == EXPECTED_COMMIT
+                and not git('-C', path, 'status', '--porcelain'))
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        return False
+REPO = Path('/kaggle/working') / ('FADC-AV-' + EXPECTED_COMMIT[:12])
+if STATE_FILE.is_file():
+    try:
+        previous = json.loads(STATE_FILE.read_text())
+        if usable(Path(previous['repo'])):
+            REPO = Path(previous['repo'])
+    except (KeyError, ValueError):
+        pass
+if not (REPO.exists() and usable(REPO)):
+    if REPO.exists():
+        print('Preserving existing checkout; creating a clean code folder.')
+        REPO = Path(tempfile.mkdtemp(prefix='FADC-AV-clean-', dir='/kaggle/working'))
+    subprocess.run(['git', 'clone', '--no-checkout', REPO_URL, str(REPO)], check=True)
+    subprocess.run(['git', '-C', str(REPO), 'checkout', '--detach', EXPECTED_COMMIT], check=True)
+assert usable(REPO)
+config = json.loads((REPO / CONFIG_RELATIVE).read_text())
+assert config['variant'] == 'fadc_enc3', 'Wrong experiment configuration'
+state = dict(repo=str(REPO), config=CONFIG_RELATIVE, cache_root=str(CACHE_ROOT),
+             output=str(OUTPUT), resume=RESUME, commit=EXPECTED_COMMIT)
+STATE_FILE.write_text(json.dumps(state, indent=2))
+print('Setup saved:', STATE_FILE)
+print('Experiment:', config['variant'], '| output:', OUTPUT, '| resume:', RESUME)
+"""), cell('code', BOOTSTRAP + "\nsession.verify()\n"),
+cell('code', BOOTSTRAP + "\n# Optional for resume: prepare() detects existing checkpoints.\nsession.prepare()\n"),
+cell('code', BOOTSTRAP + "\n# Reads saved reports and checkpoints; no report/common/env variables needed.\nsession.train()\n"),
+cell('code', BOOTSTRAP + """
+session.evaluate()
 from IPython.display import FileLink, display
-for name in ('best.pth', 'last.pth', 'train_log.json', 'train_log.csv', 'evaluation.json', 'train_provenance.json', 'pip_freeze.txt'):
-    display(FileLink(str(OUTPUT / name)))
-print('Save a Kaggle notebook version with outputs to retain artifacts after the session ends.')
+for name in ('best.pth', 'last.pth', 'train_log.json', 'train_log.csv', 'evaluation.json'):
+    path = session.output / name
+    if path.is_file():
+        display(FileLink(str(path)))
+print('Save/download outputs before ending the Kaggle session.')
 """)]
 parser = argparse.ArgumentParser(__doc__)
 parser.add_argument('--commit', default='', help='Published full SHA containing the experiment code')
@@ -79,6 +99,8 @@ if args.variant == 'all_encoders':
         "replace enc3's second convolution only.": 'replace both convolutions in enc1, enc2, enc3 and enc4 (eight FADC convolutions).',
         'fadc_av/experiment.json': 'fadc_av/experiment_all_encoders.json',
         'fadc_av_enc3_full_s42': 'fadc_av_all_encoders_full_s42',
+        'fadc_av_enc3_session.json': 'fadc_av_all_encoders_session.json',
+        "config['variant'] == 'fadc_enc3'": "config['variant'] == 'fadc_all_encoders'",
     }
     for item in cells:
         source = ''.join(item['source'])
